@@ -20004,10 +20004,15 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         Ok(
             decode_market_mode(self.header.mode)? == MarketModeV16::Recovery
                 || asset_lifecycle == AssetLifecycleV16::Recovery
-                || matches!(
-                    side_mode,
-                    SideModeV16::DrainOnly | SideModeV16::ResetPending
-                ),
+                // A side collapses to DrainOnly on an asset that is still Active whenever a
+                // unilateral close takes A below MIN_A_SIDE. Forfeiting there would leave the
+                // live book one-sided (spec: `if Live: OI_eff_long == OI_eff_short`) and
+                // strand every counterparty; such legs exit through ordinary closes instead.
+                || (asset_lifecycle != AssetLifecycleV16::Active
+                    && matches!(
+                        side_mode,
+                        SideModeV16::DrainOnly | SideModeV16::ResetPending
+                    )),
         )
     }
 
