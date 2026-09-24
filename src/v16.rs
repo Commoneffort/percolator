@@ -11003,9 +11003,16 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         if counterparty_backing == 0 {
             return Ok(effective);
         }
-        let bucket = self.backing_bucket_for_domain(source.domain.get() as usize)?;
-        if bucket.status == BackingBucketStatusV16::Fresh
-            && bucket.expiry_slot > self.header.current_slot.get()
+        // Read only the two bucket fields needed; a full bucket decode per source domain is
+        // measurable at maximum portfolio shape.
+        let (asset_index, side) = self.domain_asset_side(source.domain.get() as usize)?;
+        let slot = self.markets[asset_index].engine_slot();
+        let bucket = match side {
+            SideV16::Long => &slot.backing_long,
+            SideV16::Short => &slot.backing_short,
+        };
+        if bucket.status == BackingBucketStatusV16::Fresh as u8
+            && bucket.expiry_slot.get() > self.header.current_slot.get()
         {
             return Ok(effective);
         }
