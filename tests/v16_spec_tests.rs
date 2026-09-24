@@ -10008,3 +10008,73 @@ fn issue206_resolved_close_impairs_lapsed_lien_in_either_order() {
         market.validate_shape().unwrap();
     }
 }
+
+// ---- issue #207: the terminal scan must not retire past a recreditable asset below its cursor ----
+
+#[test]
+fn issue207_terminal_scan_rewinds_to_recreditable_asset_below_cursor() {
+    const RESIDUAL: u128 = 750;
+    const SPENT: u128 = 123;
+    const RECEIVABLE: u128 = 776;
+    const ASSET: usize = 0;
+
+    let (mut header, mut markets) = market_fixture(3, 100);
+    let market_id = markets[ASSET].engine.asset.market_id.get();
+    header.vault = V16PodU128::new(RESIDUAL);
+    markets[ASSET].engine.insurance_domain_budget_long = V16PodU128::new(SPENT);
+    markets[ASSET].engine.insurance_domain_spent_long = V16PodU128::new(SPENT);
+    markets[ASSET].engine.source_credit_short =
+        SourceCreditStateV16Account::from_runtime(&SourceCreditStateV16 {
+            spent_backing_num: RECEIVABLE * BOUND_SCALE,
+            provider_receivable_num: RECEIVABLE * BOUND_SCALE,
+            ..SourceCreditStateV16::EMPTY
+        });
+    markets[ASSET].engine.backing_short =
+        BackingBucketV16Account::from_runtime(&BackingBucketV16 {
+            market_id,
+            consumed_liened_backing_num: RECEIVABLE * BOUND_SCALE,
+            status: BackingBucketStatusV16::Expired,
+            ..BackingBucketV16::EMPTY
+        });
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    market.resolve_market_not_atomic(3).unwrap();
+
+    // A cursor persisted above asset 0 must not let retirement burn asset 0's recredit.
+    assert_eq!(
+        market.advance_terminal_slab_not_atomic(3, 1),
+        Ok(TerminalSlabOutcomeV16::ScanProgress { next_asset_index: ASSET })
+    );
+    assert_eq!(market.header.vault.get(), RESIDUAL);
+    assert_eq!(
+        market.advance_terminal_slab_not_atomic(3, ASSET),
+        Ok(TerminalSlabOutcomeV16::InsuranceRecredited {
+            asset_index: ASSET,
+            amount: SPENT,
+        })
+    );
+    assert_eq!(market.header.insurance.get(), SPENT);
+    assert_eq!(market.validate_shape(), Ok(()));
+}
+
+#[test]
+fn issue207_terminal_scan_rewinds_to_fresh_backing_below_cursor() {
+    let (mut header, mut markets) = market_fixture(3, 100);
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    market
+        .deposit_fresh_counterparty_backing_not_atomic(0, 10, 5)
+        .unwrap();
+    market.resolve_market_not_atomic(3).unwrap();
+    // A cursor above the still-fresh bucket must lead back to it rather than dead-end.
+    assert_eq!(
+        market.advance_terminal_slab_not_atomic(5, 1),
+        Ok(TerminalSlabOutcomeV16::ScanProgress { next_asset_index: 0 })
+    );
+    assert_eq!(
+        market.advance_terminal_slab_not_atomic(5, 0),
+        Ok(TerminalSlabOutcomeV16::BackingExpired { domain: 0 })
+    );
+    assert_eq!(
+        market.advance_terminal_slab_not_atomic(5, 0),
+        Ok(TerminalSlabOutcomeV16::ReadyToClose { retired: 10 })
+    );
+}

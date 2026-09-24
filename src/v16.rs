@@ -12023,6 +12023,26 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             }
         }
 
+        // The window above only inspected `[scan_start, end)`. A persisted cursor can sit
+        // above an asset that became actionable after its window was scanned (for example,
+        // expiring the last Fresh bucket makes residual positive and a lower asset
+        // recreditable). Retirement must not burn that value: rewind to the first such asset
+        // instead, which keeps the wrapper's cursor live rather than dead-ending CloseSlab.
+        if scan_start_asset_index != 0 {
+            if self.header.source_fresh_backing_total_num.get() != 0 {
+                return Ok(TerminalSlabOutcomeV16::ScanProgress {
+                    next_asset_index: 0,
+                });
+            }
+            if let Some(asset_index) = self.first_terminal_claim_free_recredit_asset()? {
+                if asset_index < scan_start_asset_index {
+                    return Ok(TerminalSlabOutcomeV16::ScanProgress {
+                        next_asset_index: asset_index,
+                    });
+                }
+            }
+        }
+
         if self.header.backing_provider_earnings_total.get() != 0
             || self.header.source_fresh_backing_total_num.get() != 0
         {
