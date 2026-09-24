@@ -15045,11 +15045,15 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             .try_to_runtime()?
             .has_pending_residual();
         let mut refresh_flags = [false; V16_MAX_PORTFOLIO_ASSETS_N];
-        let mut liquidation_flags = [false; V16_MAX_PORTFOLIO_ASSETS_N];
         let mut reset_obligation_flags = [false; V16_MAX_PORTFOLIO_ASSETS_N];
         let mut b_stale_flags = [false; V16_MAX_PORTFOLIO_ASSETS_N];
         let mut recovery_refresh_flags = [false; V16_MAX_PORTFOLIO_ASSETS_N];
         let mut released_obligation_asset = None;
+        // Liquidation order must not depend on physical slot order, which a BatchTradeCpi
+        // taker controls for an unsigned LP (issue #176; spec requirement 27): pick the
+        // liquidatable leg with the highest risk contribution (effective notional), ties to
+        // the lower asset id.
+        let mut liquidation_choice: Option<(u128, usize)> = None;
         let mut slot = 0usize;
         while slot < V16_MAX_PORTFOLIO_ASSETS_N {
             let leg = account.header.legs[slot].try_to_runtime()?;
@@ -15078,7 +15082,21 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                 b_stale_flags[slot] = b_stale;
                 refresh_flags[slot] = refresh;
                 recovery_refresh_flags[slot] = asset.lifecycle == AssetLifecycleV16::Recovery;
-                liquidation_flags[slot] = liquidatable;
+                if liquidatable {
+                    let risk = V16Core::effective_abs_quantity_for_leg(asset, leg)?
+                        .checked_mul(u128::from(asset.effective_price))
+                        .unwrap_or(u128::MAX);
+                    let asset_index = leg.asset_index as usize;
+                    let better = match liquidation_choice {
+                        None => true,
+                        Some((best_risk, best_asset)) => {
+                            risk > best_risk || (risk == best_risk && asset_index < best_asset)
+                        }
+                    };
+                    if better {
+                        liquidation_choice = Some((risk, asset_index));
+                    }
+                }
                 reset_obligation_flags[slot] =
                     reset_obligation || Self::leg_has_exhausted_effective_oi(asset, leg);
                 let released_obligation = release_allowed
@@ -15113,7 +15131,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             ordinary_refresh_asset,
             recovery_refresh_asset,
         );
-        let liquidatable_asset = asset_of(V16Core::first_actionable_slot(liquidation_flags))?;
+        let liquidatable_asset = liquidation_choice.map(|(_, asset_index)| asset_index);
         let reset_obligation_asset =
             asset_of(V16Core::first_actionable_slot(reset_obligation_flags))?;
         Ok((
