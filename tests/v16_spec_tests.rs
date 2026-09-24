@@ -9482,3 +9482,314 @@ fn v16_auto_crank_progress_realizable_without_observation_for_every_class() {
         false,
     );
 }
+
+// ---- issue #105: an expired counterparty lien must not count as account margin ----
+#[test]
+fn issue105_expired_trade_created_lien_does_not_prevent_liquidation() {
+    let (mut header, mut markets) = market_fixture(1, 100);
+    header.config.initial_margin_bps = V16PodU64::new(5_000);
+    header.config.maintenance_margin_bps = V16PodU64::new(5_000);
+
+    let mut long_header = account_fixture(1, 240);
+    let mut short_header = account_fixture(1, 241);
+    {
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        market
+            .deposit_fresh_counterparty_backing_not_atomic(1, 100, 5)
+            .unwrap();
+
+        let mut long = PortfolioV16ViewMut::new(&mut long_header);
+        let mut short = PortfolioV16ViewMut::new(&mut short_header);
+        market.deposit_not_atomic(&mut long, 50).unwrap();
+        market.deposit_not_atomic(&mut short, 1_000).unwrap();
+
+        market
+            .execute_trade_with_fee_loss_stale_scoped_not_atomic(
+                &mut long,
+                &mut short,
+                TradeRequestV16 {
+                    asset_index: 0,
+                    size_q: signed_q(POS_SCALE),
+                    exec_price: 100,
+                    fee_bps: 0,
+                },
+            )
+            .unwrap();
+
+        market.set_asset_raw_oracle_target_not_atomic(0, 200).unwrap();
+        market.accrue_asset_to_not_atomic(0, 2, 200, 0, true).unwrap();
+        market.full_account_refresh_not_atomic(&mut long).unwrap();
+        market.full_account_refresh_not_atomic(&mut short).unwrap();
+
+        market
+            .execute_trade_with_fee_loss_stale_scoped_not_atomic(
+                &mut long,
+                &mut short,
+                TradeRequestV16 {
+                    asset_index: 0,
+                    size_q: signed_q(POS_SCALE / 2),
+                    exec_price: 200,
+                    fee_bps: 0,
+                },
+            )
+            .unwrap();
+    }
+
+    assert_eq!(
+        long_header.source_domains[0].source_lien_effective_reserved.get(),
+        100
+    );
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    for slot in 3..=5 {
+        market.accrue_asset_to_not_atomic(0, slot, 200, 0, true).unwrap();
+    }
+    market.expire_source_backing_bucket_not_atomic(1, 5).unwrap();
+
+    let bucket = market.markets[0]
+        .engine
+        .backing_short
+        .try_to_runtime()
+        .unwrap();
+    assert_eq!(bucket.status, BackingBucketStatusV16::Impaired);
+    assert_eq!(bucket.valid_liened_backing_num, 0);
+    assert_eq!(bucket.impaired_liened_backing_num, 100 * BOUND_SCALE);
+
+    let mut long = PortfolioV16ViewMut::new(&mut long_header);
+    let cert = market.full_account_refresh_not_atomic(&mut long).unwrap();
+
+    assert_eq!(long.header.capital.get(), 50);
+    // The impaired lien no longer supports equity: the 100-atom deficit is visible.
+    assert_eq!(cert.certified_equity, 50);
+    assert_eq!(cert.certified_maintenance_req, 150);
+    assert_eq!(cert.certified_liq_deficit, 100);
+    assert!(market
+        .build_actionable_summary(&long.as_view())
+        .unwrap()
+        .liquidatable);
+}
+
+// ---- issue #132: resolved close of a DrainOnly residual leg must not underflow OI ----
+
+#[test]
+fn issue132_drain_only_residual_leg_closes_after_resolution() {
+    let (mut header, mut markets) = market_fixture(1, 1);
+    header.config.initial_margin_bps = V16PodU64::new(500);
+    header.config.maintenance_margin_bps = V16PodU64::new(250);
+    header.config.max_price_move_bps_per_slot = V16PodU64::new(100);
+
+    let mut long_header = account_fixture(1, 213);
+    let mut short_header = account_fixture(1, 214);
+    let stranded_q = 10_751 * POS_SCALE;
+    let residual_q = POS_SCALE;
+
+    {
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        let mut long = PortfolioV16ViewMut::new(&mut long_header);
+        let mut short = PortfolioV16ViewMut::new(&mut short_header);
+        market.deposit_not_atomic(&mut long, 1_000).unwrap();
+        market.deposit_not_atomic(&mut short, 1_000).unwrap();
+        market
+            .execute_trade_with_fee_loss_stale_scoped_not_atomic(
+                &mut long,
+                &mut short,
+                TradeRequestV16 {
+                    asset_index: 0,
+                    size_q: signed_q(stranded_q),
+                    exec_price: 1,
+                    fee_bps: 0,
+                },
+            )
+            .unwrap();
+    }
+
+    {
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        let mut long = PortfolioV16ViewMut::new(&mut long_header);
+        market
+            .rebalance_reduce_position_not_atomic(
+                &mut long,
+                RebalanceRequestV16 {
+                    asset_index: 0,
+                    reduce_q: stranded_q - residual_q,
+                },
+            )
+            .unwrap();
+    }
+
+    let asset = markets[0].engine.asset.try_to_runtime().unwrap();
+    let short_leg = short_header.legs[0].try_to_runtime().unwrap();
+    assert_eq!(asset.oi_eff_long_q, residual_q);
+    assert_eq!(asset.oi_eff_short_q, residual_q);
+    assert_eq!(asset.mode_short, SideModeV16::DrainOnly);
+    assert_eq!(short_leg.basis_pos_q, -signed_q(stranded_q));
+
+    {
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        market
+            .resolve_market_not_atomic(market.header.current_slot.get())
+            .unwrap();
+    }
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut short = PortfolioV16ViewMut::new(&mut short_header);
+    market.validate_shape().unwrap();
+    short.validate_with_market(&market.as_view()).unwrap();
+
+    assert_eq!(
+        market
+            .close_resolved_account_not_atomic(&mut short, 0)
+            .map(|_| ()),
+        Ok(()),
+        "resolved close must scale the stranded DrainOnly leg by the side A factor"
+    );
+    market.validate_shape().unwrap();
+}
+
+
+// ---- issue #204: a mid-close deposit must lower the close ledger's residual ----
+
+fn issue204_pending_close_fixture() -> (
+    MarketGroupV16HeaderAccount,
+    Vec<Market<u64>>,
+    PortfolioAccountV16Account,
+    PortfolioAccountV16Account,
+) {
+    const SIZE_Q: u128 = 10 * POS_SCALE;
+    let (mut header, mut markets) = market_fixture(1, 100);
+    header.config.maintenance_margin_bps = V16PodU64::new(1_000);
+    header.config.initial_margin_bps = V16PodU64::new(1_000);
+    header.config.max_price_move_bps_per_slot = V16PodU64::new(500);
+    header.config.max_accrual_dt_slots = V16PodU64::new(1);
+    header.config.min_funding_lifetime_slots = V16PodU64::new(1);
+    let mut long_header = account_fixture(1, 61);
+    let mut short_header = account_fixture(1, 62);
+    {
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        let mut long = PortfolioV16ViewMut::new(&mut long_header);
+        let mut short = PortfolioV16ViewMut::new(&mut short_header);
+        market.deposit_not_atomic(&mut long, 1_000).unwrap();
+        market.deposit_not_atomic(&mut short, 250).unwrap();
+        market
+            .execute_trade_with_fee_loss_stale_scoped_not_atomic(
+                &mut long,
+                &mut short,
+                TradeRequestV16 {
+                    asset_index: 0,
+                    size_q: signed_q(SIZE_Q),
+                    exec_price: 100,
+                    fee_bps: 0,
+                },
+            )
+            .unwrap();
+        for (offset, price) in (105u64..=150).step_by(5).enumerate() {
+            let slot = 2 + offset as u64;
+            market.set_asset_raw_oracle_target_not_atomic(0, price).unwrap();
+            market.accrue_asset_to_not_atomic(0, slot, price, 0, true).unwrap();
+        }
+        market
+            .execute_trade_with_fee_loss_stale_scoped_not_atomic(
+                &mut long,
+                &mut short,
+                TradeRequestV16 {
+                    asset_index: 0,
+                    size_q: -signed_q(SIZE_Q),
+                    exec_price: 150,
+                    fee_bps: 0,
+                },
+            )
+            .unwrap();
+        let pending = short.header.close_progress.try_to_runtime().unwrap();
+        assert_eq!(pending.residual_remaining, 250);
+        assert_eq!(short.header.pnl.get(), -250);
+    }
+    (header, markets, long_header, short_header)
+}
+
+fn issue204_pending(l: percolator::CloseProgressLedgerV16) -> bool {
+    l.active && !l.finalized && !l.canceled && l.residual_remaining != 0
+}
+
+fn issue204_charged(ledger: percolator::CloseProgressLedgerV16) -> u128 {
+    ledger.support_consumed + ledger.insurance_spent + ledger.b_loss_booked
+        + ledger.explicit_loss_assigned
+}
+
+#[test]
+fn issue204_live_advance_close_charges_only_the_post_deposit_residual() {
+    let (mut header, mut markets, _long_header, mut short_header) =
+        issue204_pending_close_fixture();
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut short = PortfolioV16ViewMut::new(&mut short_header);
+    market.deposit_not_atomic(&mut short, 100).unwrap();
+    let work = AutoCrankWorkV16 {
+        now_slot: 11,
+        observations: &[],
+        resolved_close_fee_rate_per_slot: 0,
+    };
+    let mut steps = 0;
+    while issue204_pending(short.header.close_progress.try_to_runtime().unwrap()) {
+        market
+            .permissionless_auto_crank_not_atomic(&mut short, work)
+            .expect("pending close continues");
+        steps += 1;
+        assert!(steps < 8, "close must finalize");
+    }
+    let ledger = short.header.close_progress.try_to_runtime().unwrap();
+    assert!(ledger.finalized);
+    assert_eq!(ledger.residual_remaining, 0);
+    // 100 of the 250 loss was paid by the depositor's own principal; only 150 may be
+    // charged to the opposite side.
+    assert_eq!(issue204_charged(ledger), 150);
+    assert_eq!(short.header.capital.get(), 0);
+    assert_eq!(short.header.pnl.get(), 0);
+    market.validate_shape().unwrap();
+    short.validate_with_market(&market.as_view()).unwrap();
+}
+
+#[test]
+fn issue204_full_principal_cure_releases_the_domain_barrier() {
+    let (mut header, mut markets, _long_header, mut short_header) =
+        issue204_pending_close_fixture();
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut short = PortfolioV16ViewMut::new(&mut short_header);
+    market.deposit_not_atomic(&mut short, 400).unwrap();
+    let work = AutoCrankWorkV16 {
+        now_slot: 11,
+        observations: &[],
+        resolved_close_fee_rate_per_slot: 0,
+    };
+    let mut steps = 0;
+    while issue204_pending(short.header.close_progress.try_to_runtime().unwrap()) {
+        market
+            .permissionless_auto_crank_not_atomic(&mut short, work)
+            .expect("pending close continues");
+        steps += 1;
+        assert!(steps < 8, "close must finalize");
+    }
+    let ledger = short.header.close_progress.try_to_runtime().unwrap();
+    assert_eq!(issue204_charged(ledger), 0);
+    assert_eq!(short.header.capital.get(), 150);
+    assert_eq!(short.header.pnl.get(), 0);
+    assert_eq!(
+        market.markets[0].engine.pending_domain_loss_barrier_long.get(),
+        0
+    );
+    market.validate_shape().unwrap();
+    short.validate_with_market(&market.as_view()).unwrap();
+}
+
+#[test]
+fn issue204_resolved_close_charges_only_the_post_deposit_residual() {
+    let (mut header, mut markets, _long_header, mut short_header) =
+        issue204_pending_close_fixture();
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut short = PortfolioV16ViewMut::new(&mut short_header);
+    market.deposit_not_atomic(&mut short, 100).unwrap();
+    let slot = market.header.current_slot.get();
+    market.resolve_market_not_atomic(slot).unwrap();
+    let _ = market.close_resolved_account_not_atomic(&mut short, 0);
+    let ledger = short.header.close_progress.try_to_runtime().unwrap();
+    assert_eq!(issue204_charged(ledger), 150);
+    assert_eq!(ledger.residual_remaining, 0);
+}
