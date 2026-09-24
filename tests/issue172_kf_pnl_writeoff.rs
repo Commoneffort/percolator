@@ -73,6 +73,10 @@ struct Out { lp0: i128, lp1: i128, tr0: i128, tr1: i128, v0: u128, v1: u128,
 /// Emulates on-chain transaction atomicity: a settlement that returns Err is
 /// rolled back, so a rejected step never leaves a partial mutation behind.
 fn run(path: &[u64], lp_dep: u128, tr_dep: u128, size_tokens: i128) -> Out {
+    run_ordered(path, lp_dep, tr_dep, size_tokens, false)
+}
+
+fn run_ordered(path: &[u64], lp_dep: u128, tr_dep: u128, size_tokens: i128, tr_first: bool) -> Out {
     let init = path[0];
     let (mut header, mut markets) = fixture(init);
     let mut lp = account(200);
@@ -99,7 +103,7 @@ fn run(path: &[u64], lp_dep: u128, tr_dep: u128, size_tokens: i128) -> Out {
         let good = (|| -> Result<(), ()> {
             let mut m = MarketGroupV16ViewMut::new(&mut header, &mut markets);
             m.accrue_asset_to_not_atomic(0, slot, px, 0, true).map_err(|_| ())?;
-            if std::env::var("TR_FIRST").is_ok() {
+            if tr_first {
                 m.full_account_refresh_not_atomic(&mut PortfolioV16ViewMut::new(&mut tr)).map_err(|_| ())?;
                 m.full_account_refresh_not_atomic(&mut PortfolioV16ViewMut::new(&mut lp)).map_err(|_| ())?;
             } else {
@@ -162,22 +166,33 @@ fn issue172_site1_zero_net_price_churn_is_value_neutral() {
     assert_eq!(o.lp1, o.lp0, "zero-net price churn must not cost the LP (issue #172 site 1)");
 }
 
-/// SITE 2 — `apply_signed_kf_delta_to_pnl`.
-/// PRECONDITION: on a loss, `settle_leg_kf_effects_at_slot_with_asset` calls site 1
-/// (pnl goes negative) and then `reserve_new_capital_backed_loss_for_source_domain_not_atomic`
-/// charges it to CAPITAL, returning pnl to 0. So pnl only STAYS negative once capital
-/// is EXHAUSTED. Only then can a gain arrive at a negative-pnl account and be burned.
+/// Issue #172 site 2 — `apply_signed_kf_delta_to_pnl`.
+/// A gain arriving at an account whose capital is exhausted (negative pnl) must be able to cure
+/// that loss from its source domain's backing. It used to see zero support whenever the domain
+/// had no registered claims, so every reversal gain was burned and the LP ended bankrupt on a
+/// path that returns exactly to its start.
 #[test]
-fn finding_site2_exhausted_lp_cannot_recover_on_reversal() {
+fn issue172_site2_exhausted_lp_recovers_on_reversal() {
     let mut path = geo(100_000, 400_000, true);
     path.extend(geo(400_000, 100_000, false).into_iter().skip(1));
     assert_eq!(*path.last().unwrap(), 100_000, "path must return exactly to start");
-    let o = run(&path, 1_000_000_000, 500_000_000_000, 5_000);
-    println!("\nSITE 2 — levered LP, 100k -> 400k -> 100k, ending EXACTLY where it started:");
-    show(&o, path.len() - 1);
-    assert!(o.ok > 20, "VACUOUS: engine barely settled");
-    assert!(o.neg_steps > 0, "PRECONDITION NOT MET: pnl never went negative");
-    assert!(o.gain_into_neg > 0, "PRECONDITION NOT MET: no gain ever arrived at a negative-pnl account");
-    assert_eq!(o.v0, o.v1, "no external tokens moved — purely internal accounting");
-    assert!(o.lp1 < 0, "LP ends BANKRUPT on a zero-net-move path");
+    for tr_first in [false, true] {
+        let o = run_ordered(&path, 1_000_000_000, 500_000_000_000, 5_000, tr_first);
+        println!("\nSITE 2 (counterparty refreshed first: {tr_first}):");
+        show(&o, path.len() - 1);
+        assert!(o.ok > 20, "VACUOUS: engine barely settled");
+        assert!(o.neg_steps > 0, "PRECONDITION NOT MET: pnl never went negative");
+        assert!(o.gain_into_neg > 0, "PRECONDITION NOT MET: no gain reached a negative-pnl account");
+        assert_eq!(o.v0, o.v1, "no external tokens moved");
+        assert!(o.lp1 > 0, "the LP must not end bankrupt on a zero-net path");
+        if tr_first {
+            assert_eq!(o.lp1, o.lp0, "with backing reserved first the LP recovers exactly");
+        } else {
+            // Only the first reversal step's gain can precede any reserved backing.
+            assert!(o.lp0 - o.lp1 <= 50_000_000, "LP shortfall must be bounded by one step");
+        }
+        // The counterparty's residual cost is the realizable-limited haircut from the window in
+        // which the LP was insolvent; the value stays in the junior pool (vault is flat).
+        assert!(o.tr0 - o.tr1 < 150_000_000);
+    }
 }
