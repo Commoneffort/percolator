@@ -10269,3 +10269,61 @@ fn issue176_liquidation_selects_same_leg_for_any_slot_order() {
         "the larger-notional leg is liquidated first"
     );
 }
+
+// ---- issue #175: support consumed by a cross-asset loss must back the loss domain ----
+
+#[test]
+fn issue175_cross_refresh_loss_moves_consumed_support_to_loss_domain() {
+    let (mut header, mut markets) = market_fixture(2, 100);
+    header.config.initial_margin_bps = V16PodU64::new(1_000);
+    header.config.maintenance_margin_bps = V16PodU64::new(500);
+    header.config.max_price_move_bps_per_slot = V16PodU64::new(1_000);
+    let mut x_header = account_fixture(2, 175);
+    let mut y_header = account_fixture(2, 176);
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    // Provider backs claims attributed to asset 1's short side (domain 3).
+    market
+        .deposit_fresh_counterparty_backing_not_atomic(3, 10, 1_000)
+        .unwrap();
+    let mut x = PortfolioV16ViewMut::new(&mut x_header);
+    let mut y = PortfolioV16ViewMut::new(&mut y_header);
+    market.deposit_not_atomic(&mut x, 1_000).unwrap();
+    market.deposit_not_atomic(&mut y, 1_000).unwrap();
+    // X long 1 of asset 1, X short 1 of asset 0; Y takes the other sides.
+    market
+        .execute_trade_with_fee_loss_stale_scoped_not_atomic(
+            &mut x,
+            &mut y,
+            TradeRequestV16 { asset_index: 1, size_q: signed_q(POS_SCALE), exec_price: 100, fee_bps: 0 },
+        )
+        .unwrap();
+    market
+        .execute_trade_with_fee_loss_stale_scoped_not_atomic(
+            &mut y,
+            &mut x,
+            TradeRequestV16 { asset_index: 0, size_q: signed_q(POS_SCALE), exec_price: 100, fee_bps: 0 },
+        )
+        .unwrap();
+    // Asset 1 rises 10; only X refreshes, so X's +10 claim is backed by the provider.
+    market.set_asset_raw_oracle_target_not_atomic(1, 110).unwrap();
+    market.accrue_asset_to_not_atomic(1, 3, 110, 0, true).unwrap();
+    market.accrue_asset_to_not_atomic(0, 3, 100, 0, true).unwrap();
+    market.full_account_refresh_not_atomic(&mut x).unwrap();
+    assert_eq!(x.header.pnl.get(), 10);
+    // Asset 0 rises 10: X (short) loses 10 against its existing positive face.
+    market.set_asset_raw_oracle_target_not_atomic(0, 110).unwrap();
+    market.accrue_asset_to_not_atomic(0, 4, 110, 0, true).unwrap();
+    market.accrue_asset_to_not_atomic(1, 4, 110, 0, true).unwrap();
+    market.full_account_refresh_not_atomic(&mut x).unwrap();
+    assert_eq!(x.header.pnl.get(), 0);
+    market.full_account_refresh_not_atomic(&mut y).unwrap();
+    // Y's +10 on asset 0 is attributed to asset 0's short side (domain 1) and must be backed.
+    let domain1 = market.markets[0].engine.source_credit_short.try_to_runtime().unwrap();
+    assert!(
+        domain1.fresh_reserved_backing_num >= 10 * BOUND_SCALE,
+        "the loss domain must hold backing for the winner's claim: {domain1:?}"
+    );
+    market.validate_shape().unwrap();
+    x.validate_with_market(&market.as_view()).unwrap();
+    y.validate_with_market(&market.as_view()).unwrap();
+}

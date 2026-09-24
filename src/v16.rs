@@ -13072,6 +13072,41 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         })
     }
 
+    /// A negative K/F delta that lands on existing positive face is paid by consuming that
+    /// face's source support, which reclassifies the supporting backing into the junior pool.
+    /// The winners of this loss hold claims attributed to `loss_domain`, so the same amount must
+    /// become that domain's backing, exactly as a capital-paid loss would; otherwise the winners
+    /// cannot realize in Live while the consumed provider principal sits as unowned residual
+    /// (issue #175). Skipped when the loss domain's bucket cannot take fresh backing (impaired
+    /// or lapsed), leaving the value junior as before.
+    fn move_consumed_support_to_loss_domain_not_atomic(
+        &mut self,
+        loss_domain: usize,
+        support_consumed: u128,
+    ) -> V16Result<()> {
+        if support_consumed == 0
+            || decode_market_mode(self.header.mode)? != MarketModeV16::Live
+        {
+            return Ok(());
+        }
+        let bucket = self.backing_bucket_for_domain(loss_domain)?;
+        let accepts = match bucket.status {
+            BackingBucketStatusV16::Empty | BackingBucketStatusV16::Expired => true,
+            BackingBucketStatusV16::Fresh => bucket.expiry_slot > self.header.current_slot.get(),
+            _ => false,
+        };
+        let amount = support_consumed.min(self.residual());
+        if !accepts || amount == 0 {
+            return Ok(());
+        }
+        let expiry_slot = self.fresh_counterparty_backing_expiry_slot(loss_domain)?;
+        self.add_fresh_counterparty_backing_unchecked(
+            loss_domain,
+            V16Core::bound_num_from_amount(amount)?,
+            expiry_slot,
+        )
+    }
+
     fn reserve_new_capital_backed_loss_for_source_domain_not_atomic(
         &mut self,
         account: &mut PortfolioV16ViewMut<'_>,
@@ -13426,13 +13461,17 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                 self.apply_signed_kf_delta_to_pnl(account, prepared.net, Some(source_domain))?;
             } else {
                 let negative_before = account.header.pnl.get().min(0).unsigned_abs();
-                self.apply_signed_kf_delta_to_pnl(account, prepared.net, None)?;
+                let application = self.apply_signed_kf_delta_to_pnl(account, prepared.net, None)?;
                 let negative_after = account.header.pnl.get().min(0).unsigned_abs();
                 self.reserve_new_capital_backed_loss_for_source_domain_not_atomic(
                     account,
                     source_domain,
                     negative_before,
                     negative_after,
+                )?;
+                self.move_consumed_support_to_loss_domain_not_atomic(
+                    source_domain,
+                    application.support_consumed,
                 )?;
             }
         }
