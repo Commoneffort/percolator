@@ -12023,26 +12023,10 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             }
         }
 
-        // The window above only inspected `[scan_start, end)`. A persisted cursor can sit
-        // above an asset that became actionable after its window was scanned (for example,
-        // expiring the last Fresh bucket makes residual positive and a lower asset
-        // recreditable). Retirement must not burn that value: rewind to the first such asset
-        // instead, which keeps the wrapper's cursor live rather than dead-ending CloseSlab.
-        if scan_start_asset_index != 0 {
-            if self.header.source_fresh_backing_total_num.get() != 0 {
-                return Ok(TerminalSlabOutcomeV16::ScanProgress {
-                    next_asset_index: 0,
-                });
-            }
-            if let Some(asset_index) = self.first_terminal_claim_free_recredit_asset()? {
-                if asset_index < scan_start_asset_index {
-                    return Ok(TerminalSlabOutcomeV16::ScanProgress {
-                        next_asset_index: asset_index,
-                    });
-                }
-            }
-        }
-
+        // Continuation contract: the window above inspected only `[scan_start, end)`. Callers
+        // must restart from asset 0 after `BackingExpired` (expiry can raise residual and make
+        // a lower asset recreditable, issue #207); a recredit only lowers residual, so resuming
+        // at its asset index is complete. percolator-prog persists exactly this cursor.
         if self.header.backing_provider_earnings_total.get() != 0
             || self.header.source_fresh_backing_total_num.get() != 0
         {
@@ -20113,22 +20097,30 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         )
     }
 
-    fn leg_is_dead_for_forfeit(&self, asset_index: usize, side: SideV16) -> V16Result<bool> {
-        let side_mode = self.side_mode_for(asset_index, side)?;
-        let asset_lifecycle = self.asset_state(asset_index)?.lifecycle;
-        Ok(
-            decode_market_mode(self.header.mode)? == MarketModeV16::Recovery
-                || asset_lifecycle == AssetLifecycleV16::Recovery
-                // A side collapses to DrainOnly on an asset that is still Active whenever a
-                // unilateral close takes A below MIN_A_SIDE. Forfeiting there would leave the
-                // live book one-sided (spec: `if Live: OI_eff_long == OI_eff_short`) and
-                // strand every counterparty; such legs exit through ordinary closes instead.
-                || (asset_lifecycle != AssetLifecycleV16::Active
-                    && matches!(
-                        side_mode,
-                        SideModeV16::DrainOnly | SideModeV16::ResetPending
-                    )),
-        )
+    fn leg_is_dead_for_forfeit(&self, asset_index: usize, leg: PortfolioLegV16) -> V16Result<bool> {
+        let side_mode = self.side_mode_for(asset_index, leg.side)?;
+        let asset = self.asset_state(asset_index)?;
+        if decode_market_mode(self.header.mode)? == MarketModeV16::Recovery
+            || asset.lifecycle == AssetLifecycleV16::Recovery
+        {
+            return Ok(true);
+        }
+        if !matches!(
+            side_mode,
+            SideModeV16::DrainOnly | SideModeV16::ResetPending
+        ) {
+            return Ok(false);
+        }
+        // A side collapses to DrainOnly on an asset that is still Active whenever a unilateral
+        // close takes A below MIN_A_SIDE. Forfeiting a leg that still carries effective OI there
+        // would leave the live book one-sided (spec: `if Live: OI_eff_long == OI_eff_short`) and
+        // strand every counterparty (issue #205); such legs exit through ordinary closes. A leg
+        // whose effective quantity is already zero (an ADL survivor) contributes no OI, so its
+        // forfeit remains the owner's cleanup route.
+        if asset.lifecycle != AssetLifecycleV16::Active {
+            return Ok(true);
+        }
+        Ok(V16Core::effective_abs_quantity_for_leg(asset, leg)? == 0)
     }
 
     fn settle_forfeited_leg_kf_effects(
@@ -20254,7 +20246,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         if !leg.active {
             return Err(V16Error::InvalidLeg);
         }
-        if !self.leg_is_dead_for_forfeit(asset_index, leg.side)? {
+        if !self.leg_is_dead_for_forfeit(asset_index, leg)? {
             return Err(V16Error::LockActive);
         }
         if Self::leg_has_exhausted_effective_oi(self.asset_state(asset_index)?, leg)
