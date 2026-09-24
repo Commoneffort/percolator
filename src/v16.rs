@@ -13098,41 +13098,6 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         })
     }
 
-    /// A negative K/F delta that lands on existing positive face is paid by consuming that
-    /// face's source support, which reclassifies the supporting backing into the junior pool.
-    /// The winners of this loss hold claims attributed to `loss_domain`, so the same amount must
-    /// become that domain's backing, exactly as a capital-paid loss would; otherwise the winners
-    /// cannot realize in Live while the consumed provider principal sits as unowned residual
-    /// (issue #175). Skipped when the loss domain's bucket cannot take fresh backing (impaired
-    /// or lapsed), leaving the value junior as before.
-    fn move_consumed_support_to_loss_domain_not_atomic(
-        &mut self,
-        loss_domain: usize,
-        support_consumed: u128,
-    ) -> V16Result<()> {
-        if support_consumed == 0
-            || decode_market_mode(self.header.mode)? != MarketModeV16::Live
-        {
-            return Ok(());
-        }
-        let bucket = self.backing_bucket_for_domain(loss_domain)?;
-        let accepts = match bucket.status {
-            BackingBucketStatusV16::Empty | BackingBucketStatusV16::Expired => true,
-            BackingBucketStatusV16::Fresh => bucket.expiry_slot > self.header.current_slot.get(),
-            _ => false,
-        };
-        let amount = support_consumed.min(self.residual());
-        if !accepts || amount == 0 {
-            return Ok(());
-        }
-        let expiry_slot = self.fresh_counterparty_backing_expiry_slot(loss_domain)?;
-        self.add_fresh_counterparty_backing_unchecked(
-            loss_domain,
-            V16Core::bound_num_from_amount(amount)?,
-            expiry_slot,
-        )
-    }
-
     fn reserve_new_capital_backed_loss_for_source_domain_not_atomic(
         &mut self,
         account: &mut PortfolioV16ViewMut<'_>,
@@ -13484,28 +13449,16 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         }
         if prepared.net != 0 {
             if prepared.net > 0 {
-                let application =
-                    self.apply_signed_kf_delta_to_pnl(account, prepared.net, Some(source_domain))?;
-                // A gain that cures an outstanding loss consumes support from its source domain.
-                // That loss is owed to claimants attributed to this leg's own side, so the cure
-                // backs their domain, the same way a capital-paid loss would (issue #172).
-                self.move_consumed_support_to_loss_domain_not_atomic(
-                    self.insurance_domain_index(asset_index, leg.side)?,
-                    application.support_consumed,
-                )?;
+                self.apply_signed_kf_delta_to_pnl(account, prepared.net, Some(source_domain))?;
             } else {
                 let negative_before = account.header.pnl.get().min(0).unsigned_abs();
-                let application = self.apply_signed_kf_delta_to_pnl(account, prepared.net, None)?;
+                self.apply_signed_kf_delta_to_pnl(account, prepared.net, None)?;
                 let negative_after = account.header.pnl.get().min(0).unsigned_abs();
                 self.reserve_new_capital_backed_loss_for_source_domain_not_atomic(
                     account,
                     source_domain,
                     negative_before,
                     negative_after,
-                )?;
-                self.move_consumed_support_to_loss_domain_not_atomic(
-                    source_domain,
-                    application.support_consumed,
                 )?;
             }
         }
@@ -15118,15 +15071,11 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             .try_to_runtime()?
             .has_pending_residual();
         let mut refresh_flags = [false; V16_MAX_PORTFOLIO_ASSETS_N];
+        let mut liquidation_flags = [false; V16_MAX_PORTFOLIO_ASSETS_N];
         let mut reset_obligation_flags = [false; V16_MAX_PORTFOLIO_ASSETS_N];
         let mut b_stale_flags = [false; V16_MAX_PORTFOLIO_ASSETS_N];
         let mut recovery_refresh_flags = [false; V16_MAX_PORTFOLIO_ASSETS_N];
         let mut released_obligation_asset = None;
-        // Liquidation order must not depend on physical slot order, which a BatchTradeCpi
-        // taker controls for an unsigned LP (issue #176; spec requirement 27): pick the
-        // liquidatable leg with the highest risk contribution (effective notional), ties to
-        // the lower asset id.
-        let mut liquidation_choice: Option<(u128, usize)> = None;
         let mut slot = 0usize;
         while slot < V16_MAX_PORTFOLIO_ASSETS_N {
             let leg = account.header.legs[slot].try_to_runtime()?;
@@ -15155,21 +15104,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                 b_stale_flags[slot] = b_stale;
                 refresh_flags[slot] = refresh;
                 recovery_refresh_flags[slot] = asset.lifecycle == AssetLifecycleV16::Recovery;
-                if liquidatable {
-                    let risk = V16Core::effective_abs_quantity_for_leg(asset, leg)?
-                        .checked_mul(u128::from(asset.effective_price))
-                        .unwrap_or(u128::MAX);
-                    let asset_index = leg.asset_index as usize;
-                    let better = match liquidation_choice {
-                        None => true,
-                        Some((best_risk, best_asset)) => {
-                            risk > best_risk || (risk == best_risk && asset_index < best_asset)
-                        }
-                    };
-                    if better {
-                        liquidation_choice = Some((risk, asset_index));
-                    }
-                }
+                liquidation_flags[slot] = liquidatable;
                 reset_obligation_flags[slot] =
                     reset_obligation || Self::leg_has_exhausted_effective_oi(asset, leg);
                 let released_obligation = release_allowed
@@ -15204,7 +15139,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             ordinary_refresh_asset,
             recovery_refresh_asset,
         );
-        let liquidatable_asset = liquidation_choice.map(|(_, asset_index)| asset_index);
+        let liquidatable_asset = asset_of(V16Core::first_actionable_slot(liquidation_flags))?;
         let reset_obligation_asset =
             asset_of(V16Core::first_actionable_slot(reset_obligation_flags))?;
         Ok((
@@ -20196,11 +20131,10 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         {
             return Ok(true);
         }
-        if !matches!(
-            side_mode,
-            SideModeV16::DrainOnly | SideModeV16::ResetPending
-        ) {
-            return Ok(false);
+        match side_mode {
+            SideModeV16::ResetPending => return Ok(true),
+            SideModeV16::DrainOnly => {}
+            _ => return Ok(false),
         }
         // A side collapses to DrainOnly on an asset that is still Active whenever a unilateral
         // close takes A below MIN_A_SIDE. Forfeiting a leg that still carries effective OI there

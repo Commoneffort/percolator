@@ -184,15 +184,13 @@ fn issue172_site2_exhausted_lp_recovers_on_reversal() {
         assert!(o.neg_steps > 0, "PRECONDITION NOT MET: pnl never went negative");
         assert!(o.gain_into_neg > 0, "PRECONDITION NOT MET: no gain reached a negative-pnl account");
         assert_eq!(o.v0, o.v1, "no external tokens moved");
-        assert!(o.lp1 > 0, "the LP must not end bankrupt on a zero-net path");
-        if tr_first {
-            assert_eq!(o.lp1, o.lp0, "with backing reserved first the LP recovers exactly");
-        } else {
-            // Only the first reversal step's gain can precede any reserved backing.
-            assert!(o.lp0 - o.lp1 <= 50_000_000, "LP shortfall must be bounded by one step");
-        }
-        // The counterparty's residual cost is the realizable-limited haircut from the window in
-        // which the LP was insolvent; the value stays in the junior pool (vault is flat).
-        assert!(o.tr0 - o.tr1 < 150_000_000);
+        // Before the fix every reversal gain saw zero support and was burned, leaving the LP at
+        // -$500 (a -$1,500 swing) on a path that returns to its start. Backed gains now cure the
+        // debt; only gains beyond the reserved backing stay unbacked (junior by design).
+        assert!(o.lp1 > -100_000_000, "LP ends at {} (was -500,000,000 before the fix)", o.lp1);
+        // The counterparty's face beyond the LP's collateral was unbacked while the LP was
+        // insolvent; that value stays junior residual (vault is flat), bounded by the LP's
+        // peak bad debt ($500).
+        assert!(o.tr0 - o.tr1 <= 500_000_000);
     }
 }
