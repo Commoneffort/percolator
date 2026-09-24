@@ -9685,6 +9685,35 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         self.validate_shape()
     }
 
+    /// Return `amount` of an account's counterparty lien backing to its bucket. A Fresh bucket
+    /// that has lapsed is first moved through the canonical expiry transition, so its liened
+    /// principal becomes impaired (spec: lapsed liens are Impaired and never raise
+    /// `available_backing_num`); an impaired lien is then retired from the impaired lane.
+    fn release_or_retire_counterparty_lien_backing_not_atomic(
+        &mut self,
+        domain: usize,
+        amount: u128,
+    ) -> V16Result<()> {
+        if amount == 0 {
+            return Ok(());
+        }
+        let current_slot = self.header.current_slot.get();
+        let mut bucket = self.backing_bucket_for_domain(domain)?;
+        if bucket.status == BackingBucketStatusV16::Fresh && bucket.expiry_slot <= current_slot {
+            self.expire_source_backing_bucket_not_atomic(domain, current_slot)?;
+            bucket = self.backing_bucket_for_domain(domain)?;
+        }
+        match bucket.status {
+            BackingBucketStatusV16::Fresh => {
+                self.release_source_credit_lien_from_counterparty_terminal_not_atomic(domain, amount)
+            }
+            BackingBucketStatusV16::Impaired => {
+                self.retire_source_credit_lien_from_counterparty_impaired_not_atomic(domain, amount)
+            }
+            _ => Err(V16Error::CounterUnderflow),
+        }
+    }
+
     fn retire_source_credit_lien_from_counterparty_impaired_not_atomic(
         &mut self,
         domain: usize,
@@ -10583,8 +10612,10 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
 
         if counterparty_backing_release != 0 {
             // Unwinding returns already-liened principal; it does not extend new
-            // credit, so expiry must not block a loss from being recognized.
-            self.release_source_credit_lien_from_counterparty_terminal_not_atomic(
+            // credit, so expiry must not block a loss from being recognized. A lapsed
+            // or impaired bucket's lien is impaired by spec, so it is retired from the
+            // impaired lane rather than un-pledged back into fresh backing.
+            self.release_or_retire_counterparty_lien_backing_not_atomic(
                 domain,
                 counterparty_backing_release,
             )?;
@@ -19356,11 +19387,11 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             }
             if bucket.status == BackingBucketStatusV16::Fresh && bucket.expiry_slot <= current_slot
             {
-                if source.source_claim_liened_num.get() != 0 {
-                    self.release_account_source_credit_lien_for_domain_not_atomic(account, domain)?;
-                } else {
-                    self.expire_source_backing_bucket_not_atomic(domain, current_slot)?;
-                }
+                // Canonical expiry first, whether or not this account holds a lien: a lapsed
+                // lien is impaired (the Impaired arm above consumes it on the next step), never
+                // un-pledged back into fresh backing. Close order therefore cannot decide
+                // whether the same principal is impaired or returned.
+                self.expire_source_backing_bucket_not_atomic(domain, current_slot)?;
                 account.compact_source_domains();
                 account.header.health_cert.valid = 0;
                 self.validate_shape()?;
