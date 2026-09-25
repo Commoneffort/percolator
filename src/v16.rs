@@ -18225,6 +18225,49 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         Ok(paid)
     }
 
+    /// Principal paid by the closing account itself is not residual for anyone else to cure.
+    /// A deposit (or any capital credit) that lands while a close ledger is pending lowers the
+    /// true deficit, so the ledger's gross loss and remaining residual drop by the same amount;
+    /// otherwise the next booking charges the pre-deposit residual to the opposite side and a
+    /// fully cured close can never finalize. The partition identity
+    /// `residual = gross + drift - progress` is preserved because both sides move together.
+    fn record_principal_cure_in_close_ledger(
+        &mut self,
+        account: &mut PortfolioV16ViewMut<'_>,
+        paid: u128,
+    ) -> V16Result<()> {
+        let mut ledger = account.header.close_progress.try_to_runtime()?;
+        if paid == 0 || !ledger.has_pending_residual() {
+            return Ok(());
+        }
+        let cure = paid.min(ledger.residual_remaining);
+        ledger.gross_loss_at_close_start = ledger
+            .gross_loss_at_close_start
+            .checked_sub(cure)
+            .ok_or(V16Error::CounterUnderflow)?;
+        ledger.residual_remaining -= cure;
+        if ledger.residual_remaining == 0 {
+            let asset_index = ledger.asset_index as usize;
+            let count = self.pending_domain_loss_barrier_count(asset_index, ledger.domain_side)?;
+            self.set_pending_domain_loss_barrier_count(
+                asset_index,
+                ledger.domain_side,
+                count.checked_sub(1).ok_or(V16Error::CounterUnderflow)?,
+            )?;
+            if ledger.has_irreversible_progress() {
+                ledger.finalized = true;
+            } else {
+                // Nothing was booked to anyone else: the close is cured, exactly as
+                // CureAndCancelClose would leave it.
+                ledger.active = false;
+                ledger.canceled = true;
+            }
+        }
+        account.header.close_progress = CloseProgressLedgerV16Account::from_runtime(&ledger);
+        account.header.health_cert.valid = 0;
+        Ok(())
+    }
+
     fn settle_negative_pnl_from_principal_core_not_atomic(
         &mut self,
         account: &mut PortfolioV16ViewMut<'_>,
@@ -18249,6 +18292,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         self.header.c_tot = V16PodU128::new(c_tot);
         self.set_account_pnl_after_principal_settlement(account, new_pnl)?;
         Self::record_account_residual_crystallized_loss(account, paid)?;
+        self.record_principal_cure_in_close_ledger(account, paid)?;
         if new_pnl < 0 {
             self.header.bankruptcy_hlock_active = 1;
         }
