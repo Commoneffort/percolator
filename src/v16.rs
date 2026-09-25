@@ -10663,6 +10663,22 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         if slot >= PORTFOLIO_SOURCE_DOMAIN_CAP {
             return Err(V16Error::InvalidLeg);
         }
+        // When the burn retires counterparty backing from the impaired lane (Impaired bucket,
+        // or a lapsed Fresh one that expiry will impair), the provider's accrued utilization
+        // fee is collected first, as the other impaired-retirement paths do.
+        if account.header.source_domains[slot]
+            .source_lien_counterparty_backing_num
+            .get()
+            != 0
+        {
+            let bucket = self.backing_bucket_for_domain(domain)?;
+            if bucket.status == BackingBucketStatusV16::Impaired
+                || (bucket.status == BackingBucketStatusV16::Fresh
+                    && bucket.expiry_slot <= self.header.current_slot.get())
+            {
+                self.collect_account_backing_utilization_fee_for_domain_not_atomic(account, domain)?;
+            }
+        }
         let source_before = account.header.source_domains[slot];
         if face_burn_num > source_before.source_claim_liened_num.get() {
             return Err(V16Error::CounterUnderflow);
@@ -10908,21 +10924,6 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         self.burn_account_source_claim_bound_num(account, fallback_burn_num)
     }
 
-    fn source_domain_realizable_support_for_face(
-        &self,
-        domain: usize,
-        face_claim: u128,
-    ) -> V16Result<u128> {
-        if face_claim == 0 {
-            return Ok(0);
-        }
-        self.validate_source_domain_ledger_current(domain)?;
-        V16Core::source_credit_state_realizable_support_for_face(
-            self.source_credit_for_domain(domain)?,
-            face_claim,
-        )
-    }
-
     /// Support a gain that is about to become a claim in `domain` could realize: the incoming
     /// face at the domain's current credit rate, capped by available backing. Unlike
     /// `source_domain_realizable_support_for_face`, this does not require the domain to already
@@ -10950,33 +10951,14 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         let fresh_num = bucket
             .fresh_unliened_backing_num
             .min(V16Core::available_backing_num_for_source_credit_state(state)?);
+        // Credit on the incoming face at the domain's rate, bounded by the fresh backing it
+        // consumes one atom per atom of credit.
         let face_limited = V16Core::mul_div_floor_u128_or_wide(
             V16Core::bound_num_from_amount(face_claim)?,
             state.credit_rate_num,
             CREDIT_RATE_SCALE,
         )? / BOUND_SCALE;
-        let backing_limited = V16Core::mul_div_floor_u128_or_wide(
-            fresh_num,
-            state.credit_rate_num,
-            CREDIT_RATE_SCALE,
-        )? / BOUND_SCALE;
-        let mut effective = face_limited.min(backing_limited);
-        // Rounding in the lien sizing can need an atom more backing than the floor above; a few
-        // bounded steps absorb it, otherwise decline the cure.
-        let mut steps = 0u8;
-        while effective != 0 {
-            let (_, backing_num) =
-                V16Core::source_credit_lien_amounts_for_effective(effective, state.credit_rate_num)?;
-            if backing_num <= fresh_num {
-                return Ok(effective);
-            }
-            steps += 1;
-            if steps == 4 {
-                return Ok(0);
-            }
-            effective -= 1;
-        }
-        Ok(0)
+        Ok(face_limited.min(fresh_num / BOUND_SCALE))
     }
 
     fn account_source_realizable_support(
@@ -13310,12 +13292,18 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                 if bucket.status == BackingBucketStatusV16::Fresh && bucket.expiry_slot <= now {
                     self.expire_source_backing_bucket_not_atomic(domain, now)?;
                 }
-                let expiry_slot = self.fresh_counterparty_backing_expiry_slot(domain)?;
-                self.add_fresh_counterparty_backing_unchecked(
-                    domain,
-                    source_backing_num,
-                    expiry_slot,
-                )?;
+                // An Impaired bucket (a lapsed one that still carries liens) cannot take new
+                // backing. As in Resolved mode, the loss then stays as junior support: the
+                // capital debit above is already proven, and the value remains in the vault
+                // outside the senior stack instead of reverting the refresh or liquidation.
+                if self.backing_bucket_for_domain(domain)?.status != BackingBucketStatusV16::Impaired {
+                    let expiry_slot = self.fresh_counterparty_backing_expiry_slot(domain)?;
+                    self.add_fresh_counterparty_backing_unchecked(
+                        domain,
+                        source_backing_num,
+                        expiry_slot,
+                    )?;
+                }
             }
             self.credit_post_snapshot_residual_not_atomic(residual_backing)?;
         }
@@ -15190,7 +15178,31 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                 let leg = account.header.legs[slot].try_to_runtime()?;
                 let asset_index = leg.asset_index as usize;
                 let asset = self.asset_state(asset_index)?;
-                let risk = V16Core::effective_abs_quantity_for_leg(asset, leg)?
+                let effective_q = V16Core::effective_abs_quantity_for_leg(asset, leg)?;
+                // Only a leg this liquidation can actually reduce competes; otherwise the crank
+                // would revert on the riskiest leg while a smaller one could progress. If no
+                // leg qualifies, the first-slot choice stands.
+                let capacity = V16Core::kernel_unilateral_close_capacity(
+                    effective_q,
+                    asset.oi_eff_long_q,
+                    asset.oi_eff_short_q,
+                );
+                let current = signed_position(leg);
+                let toward_zero = current
+                    .checked_sub(current.signum())
+                    .ok_or(V16Error::ArithmeticOverflow)?;
+                if capacity == 0
+                    || current == 0
+                    || self.position_change_touches_pending_domain_loss_barrier(
+                        asset_index,
+                        current,
+                        toward_zero,
+                    )?
+                {
+                    slot += 1;
+                    continue;
+                }
+                let risk = effective_q
                     .checked_mul(u128::from(asset.effective_price))
                     .unwrap_or(u128::MAX);
                 if choice.map_or(true, |(best_risk, _)| risk > best_risk) {
@@ -17201,6 +17213,16 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         if ledger.asset_index as usize != asset_index || ledger.domain_side != domain_side {
             return Err(V16Error::LockActive);
         }
+        self.clamp_close_residual_to_account_loss(account)?;
+        let ledger = account.header.close_progress.try_to_runtime()?;
+        if !ledger.has_pending_residual() {
+            return Ok(BResidualBookingOutcomeV16 {
+                booked_loss: 0,
+                explicit_loss: 0,
+                delta_b: 0,
+                remaining_after: 0,
+            });
+        }
         self.ensure_open_close_snapshot_current_or_recovery(&account.as_view(), ledger)?;
         let outcome = self.book_bankruptcy_residual_chunk_internal(
             asset_index,
@@ -17240,8 +17262,11 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         if insurance_used != 0 {
             self.advance_close_progress_ledger(account, 0, 0, insurance_used, 0, 0)?;
         }
+        self.clamp_close_residual_to_account_loss(account)?;
 
-        let residual = if account.header.pnl.get() < 0 {
+        let residual = if account.header.pnl.get() < 0
+            && account.header.close_progress.try_to_runtime()?.has_pending_residual()
+        {
             account.header.pnl.get().unsigned_abs()
         } else {
             0
@@ -18345,7 +18370,8 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         account: &mut PortfolioV16ViewMut<'_>,
     ) -> V16Result<()> {
         if account.header.pnl.get() >= 0 {
-            return Ok(());
+            // A pending close whose loss was cured after it began books nothing more.
+            return self.clamp_close_residual_to_account_loss(account);
         }
         if decode_market_mode(self.header.mode)? != MarketModeV16::Resolved {
             return Err(V16Error::LockActive);
@@ -18414,19 +18440,26 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         Ok(paid)
     }
 
-    /// Principal paid by the closing account itself is not residual for anyone else to cure.
-    /// A deposit (or any capital credit) that lands while a close ledger is pending lowers the
-    /// true deficit, so the ledger's gross loss and remaining residual drop by the same amount;
-    /// otherwise the next booking charges the pre-deposit residual to the opposite side and a
-    /// fully cured close can never finalize. The partition identity
-    /// `residual = gross + drift - progress` is preserved because both sides move together.
-    fn record_principal_cure_in_close_ledger(
+    /// A close ledger must never book more residual than the account still owes (issue #204).
+    /// Principal, backed gains, or any other credit can lower the account's negative PnL after
+    /// the close began; the difference is cured by the account itself, so gross loss and
+    /// residual drop by it together (partition preserved) before anything is booked to the
+    /// opposite side. A loss booked on another leg after the close began raises |pnl| and so
+    /// never reads as a cure. When the residual reaches zero the domain barrier is released.
+    fn clamp_close_residual_to_account_loss(
         &mut self,
         account: &mut PortfolioV16ViewMut<'_>,
-        paid: u128,
     ) -> V16Result<()> {
         let before = account.header.close_progress.try_to_runtime()?;
-        let (ledger, barrier_released) = V16Core::kernel_principal_cure_close_ledger(before, paid)?;
+        if !before.has_pending_residual() {
+            return Ok(());
+        }
+        let owed = account.header.pnl.get().min(0).unsigned_abs();
+        if before.residual_remaining <= owed {
+            return Ok(());
+        }
+        let excess = before.residual_remaining - owed;
+        let (ledger, barrier_released) = V16Core::kernel_principal_cure_close_ledger(before, excess)?;
         if ledger == before {
             return Ok(());
         }
@@ -18468,7 +18501,6 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         self.header.c_tot = V16PodU128::new(c_tot);
         self.set_account_pnl_after_principal_settlement(account, new_pnl)?;
         Self::record_account_residual_crystallized_loss(account, paid)?;
-        self.record_principal_cure_in_close_ledger(account, paid)?;
         if new_pnl < 0 {
             self.header.bankruptcy_hlock_active = 1;
         }
@@ -20300,15 +20332,13 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             SideModeV16::DrainOnly => {}
             _ => return Ok(false),
         }
-        // A side collapses to DrainOnly on an asset that is still Active whenever a unilateral
-        // close takes A below MIN_A_SIDE. Forfeiting a leg that still carries effective OI there
-        // would leave the live book one-sided (spec: `if Live: OI_eff_long == OI_eff_short`) and
-        // strand every counterparty (issue #205); such legs exit through ordinary closes. A leg
-        // whose effective quantity is already zero (an ADL survivor) contributes no OI, so its
+        // A side collapses to DrainOnly whenever a unilateral close takes A below MIN_A_SIDE,
+        // including on an admin DrainOnly asset in a Live market. Forfeiting a leg that still
+        // carries effective OI there would leave the live book one-sided (spec: `if Live:
+        // OI_eff_long == OI_eff_short`) and strand every counterparty (issue #205); such legs
+        // exit through ordinary closes, or forfeit once the asset enters Recovery. A leg whose
+        // effective quantity is already zero (an ADL survivor) contributes no OI, so its
         // forfeit remains the owner's cleanup route.
-        if asset.lifecycle != AssetLifecycleV16::Active {
-            return Ok(true);
-        }
         Ok(V16Core::effective_abs_quantity_for_leg(asset, leg)? == 0)
     }
 

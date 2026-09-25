@@ -10320,3 +10320,16 @@ fn resolved_receipt_terminality_is_sound_exhaustively() {
     }
     assert!(checked > 10_000);
 }
+
+#[test]
+fn issue204_deposit_frames_the_close_episode_until_booking() {
+    let (mut header, mut markets, _long_header, mut short_header) =
+        issue204_pending_close_fixture();
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut short = PortfolioV16ViewMut::new(&mut short_header);
+    let before = short.header.close_progress.try_to_runtime().unwrap();
+    market.deposit_not_atomic(&mut short, 100).unwrap();
+    // The deposit itself leaves the close episode untouched (upstream framing rule);
+    // the cure is applied only when the close next books residual.
+    assert_eq!(short.header.close_progress.try_to_runtime().unwrap(), before);
+}
