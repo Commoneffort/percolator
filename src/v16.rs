@@ -10868,14 +10868,44 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         }
         self.validate_source_domain_ledger_current(domain)?;
         let state = self.source_credit_for_domain(domain)?;
-        let credited_num = V16Core::mul_div_floor_u128_or_wide(
+        // Only fresh, unexpired counterparty backing may cure a loss here. Consuming it records
+        // the matching provider receivable; insurance-backed credit is not drawn by this path.
+        let bucket = self.backing_bucket_for_domain(domain)?;
+        if bucket.status != BackingBucketStatusV16::Fresh
+            || bucket.expiry_slot <= self.header.current_slot.get()
+        {
+            return Ok(0);
+        }
+        let fresh_num = bucket
+            .fresh_unliened_backing_num
+            .min(V16Core::available_backing_num_for_source_credit_state(state)?);
+        let face_limited = V16Core::mul_div_floor_u128_or_wide(
             V16Core::bound_num_from_amount(face_claim)?,
             state.credit_rate_num,
             CREDIT_RATE_SCALE,
-        )?;
-        Ok((credited_num / BOUND_SCALE).min(
-            V16Core::available_backing_num_for_source_credit_state(state)? / BOUND_SCALE,
-        ))
+        )? / BOUND_SCALE;
+        let backing_limited = V16Core::mul_div_floor_u128_or_wide(
+            fresh_num,
+            state.credit_rate_num,
+            CREDIT_RATE_SCALE,
+        )? / BOUND_SCALE;
+        let mut effective = face_limited.min(backing_limited);
+        // Rounding in the lien sizing can need an atom more backing than the floor above; a few
+        // bounded steps absorb it, otherwise decline the cure.
+        let mut steps = 0u8;
+        while effective != 0 {
+            let (_, backing_num) =
+                V16Core::source_credit_lien_amounts_for_effective(effective, state.credit_rate_num)?;
+            if backing_num <= fresh_num {
+                return Ok(effective);
+            }
+            steps += 1;
+            if steps == 4 {
+                return Ok(0);
+            }
+            effective -= 1;
+        }
+        Ok(0)
     }
 
     fn account_source_realizable_support(
