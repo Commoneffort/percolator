@@ -10852,6 +10852,32 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         )
     }
 
+    /// Support a gain that is about to become a claim in `domain` could realize: the incoming
+    /// face at the domain's current credit rate, capped by available backing. Unlike
+    /// `source_domain_realizable_support_for_face`, this does not require the domain to already
+    /// carry registered claims. A gain arriving at an account with an outstanding loss is such
+    /// a prospective claim; treating it as unsupported whenever the domain had no other claims
+    /// burned backed gains in full and ratcheted the loss (issue #172, site 2).
+    fn source_domain_prospective_support_for_face(
+        &self,
+        domain: usize,
+        face_claim: u128,
+    ) -> V16Result<u128> {
+        if face_claim == 0 {
+            return Ok(0);
+        }
+        self.validate_source_domain_ledger_current(domain)?;
+        let state = self.source_credit_for_domain(domain)?;
+        let credited_num = V16Core::mul_div_floor_u128_or_wide(
+            V16Core::bound_num_from_amount(face_claim)?,
+            state.credit_rate_num,
+            CREDIT_RATE_SCALE,
+        )?;
+        Ok((credited_num / BOUND_SCALE).min(
+            V16Core::available_backing_num_for_source_credit_state(state)? / BOUND_SCALE,
+        ))
+    }
+
     fn account_source_realizable_support(
         &self,
         account: &PortfolioV16View<'_>,
@@ -13011,7 +13037,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         let new_face_support = delta as u128;
         let (effective_available, source_support_domain) = if let Some(domain) = source_domain {
             (
-                self.source_domain_realizable_support_for_face(domain, new_face_support)?,
+                self.source_domain_prospective_support_for_face(domain, new_face_support)?,
                 Some(domain),
             )
         } else if decode_market_mode(self.header.mode)? == MarketModeV16::Live {

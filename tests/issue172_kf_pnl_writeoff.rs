@@ -52,7 +52,6 @@ fn sawtooth(base: u64, amp: u64, cycles: usize, per_leg: usize) -> Vec<u64> {
 
 /// Geometric ramp at 2.5%/step, inside `max_price_move_bps_per_slot` (6 bps/slot
 /// x 50 slots = 300 bps per step).
-#[allow(dead_code)] // kept for the site 2 path, which needs upstream design (see commit message)
 fn geo(from: u64, to: u64, up: bool) -> Vec<u64> {
     let mut v = vec![from];
     let mut p = from as f64;
@@ -165,4 +164,33 @@ fn issue172_site1_zero_net_price_churn_is_value_neutral() {
     assert_eq!(o.v0, o.v1, "no external tokens moved — purely internal accounting");
     assert_eq!(o.tr1, o.tr0, "counterparty is unchanged");
     assert_eq!(o.lp1, o.lp0, "zero-net price churn must not cost the LP (issue #172 site 1)");
+}
+
+/// Issue #172 site 2 — `apply_signed_kf_delta_to_pnl`.
+/// A gain arriving at an account whose capital is exhausted (negative pnl) must be able to cure
+/// that loss from its source domain's backing. It used to see zero support whenever the domain
+/// had no registered claims, so every reversal gain was burned and the LP ended bankrupt on a
+/// path that returns exactly to its start.
+#[test]
+fn issue172_site2_exhausted_lp_recovers_on_reversal() {
+    let mut path = geo(100_000, 400_000, true);
+    path.extend(geo(400_000, 100_000, false).into_iter().skip(1));
+    assert_eq!(*path.last().unwrap(), 100_000, "path must return exactly to start");
+    for tr_first in [false, true] {
+        let o = run_ordered(&path, 1_000_000_000, 500_000_000_000, 5_000, tr_first);
+        println!("\nSITE 2 (counterparty refreshed first: {tr_first}):");
+        show(&o, path.len() - 1);
+        assert!(o.ok > 20, "VACUOUS: engine barely settled");
+        assert!(o.neg_steps > 0, "PRECONDITION NOT MET: pnl never went negative");
+        assert!(o.gain_into_neg > 0, "PRECONDITION NOT MET: no gain reached a negative-pnl account");
+        assert_eq!(o.v0, o.v1, "no external tokens moved");
+        // Before the fix every reversal gain saw zero support and was burned, leaving the LP at
+        // -$500 (a -$1,500 swing) on a path that returns to its start. Backed gains now cure the
+        // debt; only gains beyond the reserved backing stay unbacked (junior by design).
+        assert!(o.lp1 > -100_000_000, "LP ends at {} (was -500,000,000 before the fix)", o.lp1);
+        // The counterparty's face beyond the LP's collateral was unbacked while the LP was
+        // insolvent; that value stays junior residual (vault is flat), bounded by the LP's
+        // peak bad debt ($500).
+        assert!(o.tr0 - o.tr1 <= 500_000_000);
+    }
 }
