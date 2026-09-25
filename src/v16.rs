@@ -1955,6 +1955,77 @@ impl V16Core {
         Ok(ledger)
     }
 
+    /// Principal paid by a closing account itself (issue #204) lowers its close ledger's gross
+    /// loss and remaining residual by the same amount, preserving
+    /// `residual = gross + drift - progress`. When the residual reaches zero the domain
+    /// barrier is released: with booked progress the close finalizes; with none it is cured
+    /// exactly as CureAndCancelClose would leave it. Returns the ledger and whether the
+    /// barrier is released.
+    pub(crate) fn kernel_principal_cure_close_ledger(
+        mut ledger: CloseProgressLedgerV16,
+        paid: u128,
+    ) -> V16Result<(CloseProgressLedgerV16, bool)> {
+        if paid == 0 || !ledger.has_pending_residual() {
+            return Ok((ledger, false));
+        }
+        // A cure never exceeds the gross loss it pays down (drift is never funded today, but
+        // residual may exceed gross by drift, which principal does not cure).
+        let cure = paid
+            .min(ledger.residual_remaining)
+            .min(ledger.gross_loss_at_close_start);
+        if cure == 0 {
+            return Ok((ledger, false));
+        }
+        ledger.gross_loss_at_close_start -= cure;
+        ledger.residual_remaining -= cure;
+        if ledger.residual_remaining != 0 {
+            return Ok((ledger, false));
+        }
+        if ledger.has_irreversible_progress() {
+            ledger.finalized = true;
+        } else {
+            ledger.active = false;
+            ledger.canceled = true;
+        }
+        Ok((ledger, true))
+    }
+
+    /// Whether some future public transition could still pay `receipt` another atom.
+    /// Claim refinement can raise the common rate while unreceipted bound remains. Otherwise
+    /// the rate can only rise through Fresh backing expiring into post-snapshot residual,
+    /// which releases whole atoms, at most the remaining Fresh backing rounded up to an
+    /// atom. The best case credits all of it at once. A receipt whose floor payout at that
+    /// best-case rate does not exceed what it was already paid holds only unrecoverable
+    /// shortfall.
+    pub(crate) fn kernel_resolved_receipt_can_still_gain(
+        ledger: ResolvedPayoutLedgerV16,
+        source_fresh_backing_total_num: u128,
+        receipt: ResolvedPayoutReceiptV16,
+    ) -> V16Result<bool> {
+        if ledger.terminal_claim_bound_unreceipted_num != 0 {
+            return Ok(true);
+        }
+        if ledger.current_payout_rate_num == ledger.current_payout_rate_den {
+            return Ok(false);
+        }
+        let releasable_num = source_fresh_backing_total_num
+            .checked_add(BOUND_SCALE - 1)
+            .ok_or(V16Error::ArithmeticOverflow)?
+            / BOUND_SCALE
+            * BOUND_SCALE;
+        let best_rate_num = ledger
+            .current_payout_rate_num
+            .checked_add(releasable_num)
+            .ok_or(V16Error::ArithmeticOverflow)?
+            .min(ledger.current_payout_rate_den);
+        let best_gross = wide_mul_div_floor_u128(
+            receipt.terminal_positive_claim_face,
+            best_rate_num,
+            ledger.current_payout_rate_den,
+        );
+        Ok(best_gross > receipt.paid_effective)
+    }
+
     /// Credit residual released after terminal snapshot capture into both
     /// persisted snapshots and immediately raise the common payout rate.
     pub(crate) fn kernel_credit_post_snapshot_residual(
@@ -13231,6 +13302,14 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                     (backing_num, 0)
                 };
             if source_backing_num != 0 {
+                // A lapsed bucket still marked Fresh cannot take backing at a new expiry.
+                // Normalize it first, exactly as the expiry crank would, so a loss that
+                // lands in this domain during refresh or liquidation is not rejected.
+                let bucket = self.backing_bucket_for_domain(domain)?;
+                let now = self.header.current_slot.get();
+                if bucket.status == BackingBucketStatusV16::Fresh && bucket.expiry_slot <= now {
+                    self.expire_source_backing_bucket_not_atomic(domain, now)?;
+                }
                 let expiry_slot = self.fresh_counterparty_backing_expiry_slot(domain)?;
                 self.add_fresh_counterparty_backing_unchecked(
                     domain,
@@ -14938,6 +15017,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             Option<usize>,
             Option<usize>,
             Option<usize>,
+            u64,
         ),
     )> {
         if now_slot < self.header.current_slot.get() {
@@ -15091,44 +15171,30 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         V16Core::kernel_is_prior_reset_obligation(side_mode, asset_epoch, leg.epoch_snap)
     }
 
-    /// The liquidatable leg with the highest risk contribution (ADL-effective notional).
-    /// Exactly equal risk keeps the persisted leg order, where the choice cannot change
-    /// the penalty.
+    /// The liquidatable leg with the highest risk contribution (ADL-effective notional),
+    /// among the slots the crank's selection pass flagged liquidatable. Exactly equal risk
+    /// keeps the persisted leg order, where the choice cannot change the penalty. A single
+    /// candidate needs no comparison.
     fn highest_risk_liquidatable_asset(
         &self,
         account: &PortfolioV16View<'_>,
+        liquidatable_slot_mask: u64,
     ) -> V16Result<Option<usize>> {
-        let bitmap = account.header.active_bitmap.map(V16PodU64::get);
+        if liquidatable_slot_mask.count_ones() < 2 {
+            return Ok(None);
+        }
         let mut choice: Option<(u128, usize)> = None;
         let mut slot = 0usize;
         while slot < V16_MAX_PORTFOLIO_ASSETS_N {
-            let leg = account.header.legs[slot].try_to_runtime()?;
-            if active_bitmap_get(bitmap, slot) && leg.active {
-                let asset = self.asset_state(leg.asset_index as usize)?;
-                let (side_mode, asset_epoch) = match leg.side {
-                    SideV16::Long => (asset.mode_long, asset.epoch_long),
-                    SideV16::Short => (asset.mode_short, asset.epoch_short),
-                };
-                let b_target = Self::b_target_for_leg_from_asset(asset, leg)?;
-                let b_settlement_pending =
-                    V16Core::kernel_b_settlement_pending(leg.b_stale, b_target, leg.b_snap)?;
-                let (_, _, liquidatable, _) = V16Core::kernel_auto_crank_leg_flags(
-                    true,
-                    asset.lifecycle,
-                    leg.basis_pos_q,
-                    asset.oi_eff_long_q.min(asset.oi_eff_short_q),
-                    side_mode,
-                    asset_epoch,
-                    leg.epoch_snap,
-                    b_settlement_pending,
-                );
-                if liquidatable {
-                    let risk = V16Core::effective_abs_quantity_for_leg(asset, leg)?
-                        .checked_mul(u128::from(asset.effective_price))
-                        .unwrap_or(u128::MAX);
-                    if choice.map_or(true, |(best_risk, _)| risk > best_risk) {
-                        choice = Some((risk, leg.asset_index as usize));
-                    }
+            if liquidatable_slot_mask & (1u64 << slot) != 0 {
+                let leg = account.header.legs[slot].try_to_runtime()?;
+                let asset_index = leg.asset_index as usize;
+                let asset = self.asset_state(asset_index)?;
+                let risk = V16Core::effective_abs_quantity_for_leg(asset, leg)?
+                    .checked_mul(u128::from(asset.effective_price))
+                    .unwrap_or(u128::MAX);
+                if choice.map_or(true, |(best_risk, _)| risk > best_risk) {
+                    choice = Some((risk, asset_index));
                 }
             }
             slot += 1;
@@ -15145,6 +15211,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         Option<usize>,
         Option<usize>,
         Option<usize>,
+        u64,
     )> {
         let bitmap = account.header.active_bitmap.map(V16PodU64::get);
         let release_allowed = !account
@@ -15222,6 +15289,14 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             recovery_refresh_asset,
         );
         let liquidatable_asset = asset_of(V16Core::first_actionable_slot(liquidation_flags))?;
+        let mut liquidatable_slot_mask = 0u64;
+        let mut flag_slot = 0usize;
+        while flag_slot < V16_MAX_PORTFOLIO_ASSETS_N {
+            if liquidation_flags[flag_slot] {
+                liquidatable_slot_mask |= 1u64 << flag_slot;
+            }
+            flag_slot += 1;
+        }
         let reset_obligation_asset =
             asset_of(V16Core::first_actionable_slot(reset_obligation_flags))?;
         Ok((
@@ -15230,6 +15305,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             liquidatable_asset,
             reset_obligation_asset,
             released_obligation_asset,
+            liquidatable_slot_mask,
         ))
     }
 
@@ -15302,6 +15378,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                 liquidatable_asset,
                 reset_obligation_asset,
                 released_obligation_asset,
+                liquidatable_slot_mask,
             ),
         ) = self.build_actionable_summary_and_selected_assets(&account.as_view(), work.now_slot)?;
         let recovery_reason = if summary.expired_close || summary.recovery_eligible {
@@ -15324,7 +15401,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         let plan = match plan {
             AutoCrankPlanV16::Liquidate { asset_index } => AutoCrankPlanV16::Liquidate {
                 asset_index: self
-                    .highest_risk_liquidatable_asset(&account.as_view())?
+                    .highest_risk_liquidatable_asset(&account.as_view(), liquidatable_slot_mask)?
                     .unwrap_or(asset_index),
             },
             plan => plan,
@@ -18348,17 +18425,12 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         account: &mut PortfolioV16ViewMut<'_>,
         paid: u128,
     ) -> V16Result<()> {
-        let mut ledger = account.header.close_progress.try_to_runtime()?;
-        if paid == 0 || !ledger.has_pending_residual() {
+        let before = account.header.close_progress.try_to_runtime()?;
+        let (ledger, barrier_released) = V16Core::kernel_principal_cure_close_ledger(before, paid)?;
+        if ledger == before {
             return Ok(());
         }
-        let cure = paid.min(ledger.residual_remaining);
-        ledger.gross_loss_at_close_start = ledger
-            .gross_loss_at_close_start
-            .checked_sub(cure)
-            .ok_or(V16Error::CounterUnderflow)?;
-        ledger.residual_remaining -= cure;
-        if ledger.residual_remaining == 0 {
+        if barrier_released {
             let asset_index = ledger.asset_index as usize;
             let count = self.pending_domain_loss_barrier_count(asset_index, ledger.domain_side)?;
             self.set_pending_domain_loss_barrier_count(
@@ -18366,14 +18438,6 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                 ledger.domain_side,
                 count.checked_sub(1).ok_or(V16Error::CounterUnderflow)?,
             )?;
-            if ledger.has_irreversible_progress() {
-                ledger.finalized = true;
-            } else {
-                // Nothing was booked to anyone else: the close is cured, exactly as
-                // CureAndCancelClose would leave it.
-                ledger.active = false;
-                ledger.canceled = true;
-            }
         }
         account.header.close_progress = CloseProgressLedgerV16Account::from_runtime(&ledger);
         account.header.health_cert.valid = 0;
@@ -19268,24 +19332,11 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
     /// floor payout at that best-case rate does not exceed what it was already paid holds
     /// only unrecoverable shortfall; waiting for dust backing to expire cannot pay it.
     fn resolved_receipt_can_still_gain(&self, receipt: ResolvedPayoutReceiptV16) -> V16Result<bool> {
-        let ledger = self.header.resolved_payout_ledger.try_to_runtime()?;
-        if ledger.terminal_claim_bound_unreceipted_num != 0 {
-            return Ok(true);
-        }
-        if ledger.current_payout_rate_num == ledger.current_payout_rate_den {
-            return Ok(false);
-        }
-        let best_rate_num = ledger
-            .current_payout_rate_num
-            .checked_add(self.header.source_fresh_backing_total_num.get())
-            .ok_or(V16Error::ArithmeticOverflow)?
-            .min(ledger.current_payout_rate_den);
-        let best_gross = wide_mul_div_floor_u128(
-            receipt.terminal_positive_claim_face,
-            best_rate_num,
-            ledger.current_payout_rate_den,
-        );
-        Ok(best_gross > receipt.paid_effective)
+        V16Core::kernel_resolved_receipt_can_still_gain(
+            self.header.resolved_payout_ledger.try_to_runtime()?,
+            self.header.source_fresh_backing_total_num.get(),
+            receipt,
+        )
     }
 
     // Clear a paid haircut receipt only when neither claim refinement nor future

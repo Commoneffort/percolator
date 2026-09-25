@@ -10244,6 +10244,7 @@ fn issue176_selected_liquidation(asset0_first: bool) -> AutoCrankPlanV16 {
     }
     market.full_account_refresh_not_atomic(&mut lp).unwrap();
     let summary = market.build_actionable_summary(&lp.as_view()).unwrap();
+    eprintln!("P176 current={} a0={} a1={}", market.header.current_slot.get(), market.markets[0].engine.asset.slot_last.get(), market.markets[1].engine.asset.slot_last.get());
     assert!(summary.liquidatable, "setup must make the LP liquidatable");
     market
         .permissionless_auto_crank_not_atomic(
@@ -10268,4 +10269,54 @@ fn issue176_liquidation_selects_same_leg_for_any_slot_order() {
         AutoCrankPlanV16::Liquidate { asset_index: 0 },
         "the larger-notional leg is liquidated first"
     );
+}
+
+// ---- resolved-receipt terminality soundness (exhaustive over small domains) ----
+
+#[cfg(feature = "fuzz")]
+#[test]
+fn resolved_receipt_terminality_is_sound_exhaustively() {
+    use percolator::{ResolvedPayoutLedgerV16, ResolvedPayoutReceiptV16, BOUND_SCALE};
+    let mut checked = 0u64;
+    for exact_atoms in 1u128..=9 {
+        for snapshot_residual in 0u128..=10 {
+            let den = exact_atoms * BOUND_SCALE;
+            let rate_num = (snapshot_residual * BOUND_SCALE).min(den);
+            let ledger = ResolvedPayoutLedgerV16 {
+                snapshot_residual,
+                terminal_claim_exact_receipts_num: den,
+                terminal_claim_bound_unreceipted_num: 0,
+                current_payout_rate_num: rate_num,
+                current_payout_rate_den: den,
+                snapshot_slot: 0,
+                payout_halted: false,
+                finalized: false,
+            };
+            for face in 1u128..=exact_atoms {
+                let paid = face * rate_num / den;
+                let receipt = ResolvedPayoutReceiptV16 {
+                    present: true,
+                    prior_bound_contribution_num: face * BOUND_SCALE,
+                    live_released_face_at_receipt: 0,
+                    terminal_positive_claim_face: face,
+                    paid_effective: paid,
+                    finalized: false,
+                };
+                for fresh_num in [0, 1, BOUND_SCALE - 1, BOUND_SCALE, BOUND_SCALE + 1, 2 * BOUND_SCALE, 3 * BOUND_SCALE - 1, 7 * BOUND_SCALE] {
+                    let can_gain = percolator::v16::kani_receipt_can_still_gain(ledger, fresh_num, receipt).unwrap();
+                    // Expiry releases whole atoms, at most the fresh backing rounded up.
+                    let max_released = fresh_num.div_ceil(BOUND_SCALE);
+                    for released in 0..=max_released {
+                        let later_num = ((snapshot_residual + released) * BOUND_SCALE).min(den);
+                        let later_gross = face * later_num / den;
+                        if !can_gain {
+                            assert!(later_gross <= paid, "unsound: exact={exact_atoms} s={snapshot_residual} face={face} fresh={fresh_num} released={released}");
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(checked > 10_000);
 }
