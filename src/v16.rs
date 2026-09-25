@@ -15091,6 +15091,51 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         V16Core::kernel_is_prior_reset_obligation(side_mode, asset_epoch, leg.epoch_snap)
     }
 
+    /// The liquidatable leg with the highest risk contribution (ADL-effective notional).
+    /// Exactly equal risk keeps the persisted leg order, where the choice cannot change
+    /// the penalty.
+    fn highest_risk_liquidatable_asset(
+        &self,
+        account: &PortfolioV16View<'_>,
+    ) -> V16Result<Option<usize>> {
+        let bitmap = account.header.active_bitmap.map(V16PodU64::get);
+        let mut choice: Option<(u128, usize)> = None;
+        let mut slot = 0usize;
+        while slot < V16_MAX_PORTFOLIO_ASSETS_N {
+            let leg = account.header.legs[slot].try_to_runtime()?;
+            if active_bitmap_get(bitmap, slot) && leg.active {
+                let asset = self.asset_state(leg.asset_index as usize)?;
+                let (side_mode, asset_epoch) = match leg.side {
+                    SideV16::Long => (asset.mode_long, asset.epoch_long),
+                    SideV16::Short => (asset.mode_short, asset.epoch_short),
+                };
+                let b_target = Self::b_target_for_leg_from_asset(asset, leg)?;
+                let b_settlement_pending =
+                    V16Core::kernel_b_settlement_pending(leg.b_stale, b_target, leg.b_snap)?;
+                let (_, _, liquidatable, _) = V16Core::kernel_auto_crank_leg_flags(
+                    true,
+                    asset.lifecycle,
+                    leg.basis_pos_q,
+                    asset.oi_eff_long_q.min(asset.oi_eff_short_q),
+                    side_mode,
+                    asset_epoch,
+                    leg.epoch_snap,
+                    b_settlement_pending,
+                );
+                if liquidatable {
+                    let risk = V16Core::effective_abs_quantity_for_leg(asset, leg)?
+                        .checked_mul(u128::from(asset.effective_price))
+                        .unwrap_or(u128::MAX);
+                    if choice.map_or(true, |(best_risk, _)| risk > best_risk) {
+                        choice = Some((risk, leg.asset_index as usize));
+                    }
+                }
+            }
+            slot += 1;
+        }
+        Ok(choice.map(|(_, asset_index)| asset_index))
+    }
+
     fn auto_crank_selected_assets(
         &self,
         account: &PortfolioV16View<'_>,
@@ -15108,11 +15153,11 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             .try_to_runtime()?
             .has_pending_residual();
         let mut refresh_flags = [false; V16_MAX_PORTFOLIO_ASSETS_N];
-        let mut liquidation_flags = [false; V16_MAX_PORTFOLIO_ASSETS_N];
         let mut reset_obligation_flags = [false; V16_MAX_PORTFOLIO_ASSETS_N];
         let mut b_stale_flags = [false; V16_MAX_PORTFOLIO_ASSETS_N];
         let mut recovery_refresh_flags = [false; V16_MAX_PORTFOLIO_ASSETS_N];
         let mut released_obligation_asset = None;
+        let mut liquidation_flags = [false; V16_MAX_PORTFOLIO_ASSETS_N];
         let mut slot = 0usize;
         while slot < V16_MAX_PORTFOLIO_ASSETS_N {
             let leg = account.header.legs[slot].try_to_runtime()?;
@@ -15273,6 +15318,17 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             V16Core::kernel_auto_crank_refresh_asset(refresh_asset, reset_obligation_asset),
             recovery_reason,
         );
+        // Liquidation order must not depend on physical slot order, which a BatchTradeCpi taker
+        // controls for an unsigned LP (issue #176; INV-061). Only a liquidation pays for the
+        // portfolio-wide risk comparison.
+        let plan = match plan {
+            AutoCrankPlanV16::Liquidate { asset_index } => AutoCrankPlanV16::Liquidate {
+                asset_index: self
+                    .highest_risk_liquidatable_asset(&account.as_view())?
+                    .unwrap_or(asset_index),
+            },
+            plan => plan,
+        };
 
         // Once the originating domain barrier is gone, a zero-basis leg carries
         // only a released loss obligation. Route it through the canonical
