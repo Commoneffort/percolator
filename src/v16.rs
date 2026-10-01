@@ -13134,17 +13134,31 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                 };
             let mut residual_backing = residual_backing;
             if source_backing_num != 0 {
-                let expiry_slot = self.fresh_counterparty_backing_expiry_slot(domain)?;
-                if expiry_slot > self.header.current_slot.get() {
-                    self.add_fresh_counterparty_backing_unchecked(
-                        domain,
-                        source_backing_num,
-                        expiry_slot,
-                    )?;
-                } else {
-                    // Past the resolved backing horizon new backing would lapse
-                    // on creation; route it where that expiry would send it.
-                    residual_backing = backing;
+                // A lapsed bucket still marked Fresh cannot take backing at a new expiry.
+                // Normalize it first, exactly as the expiry crank would, so a loss that
+                // lands in this domain during refresh or liquidation is not rejected.
+                let bucket = self.backing_bucket_for_domain(domain)?;
+                let now = self.header.current_slot.get();
+                if bucket.status == BackingBucketStatusV16::Fresh && bucket.expiry_slot <= now {
+                    self.expire_source_backing_bucket_not_atomic(domain, now)?;
+                }
+                // An Impaired bucket (a lapsed one that still carries liens) cannot take new
+                // backing. As in Resolved mode, the loss then stays as junior support: the
+                // capital debit above is already proven, and the value remains in the vault
+                // outside the senior stack instead of reverting the refresh or liquidation.
+                if self.backing_bucket_for_domain(domain)?.status != BackingBucketStatusV16::Impaired {
+                    let expiry_slot = self.fresh_counterparty_backing_expiry_slot(domain)?;
+                    if expiry_slot > now {
+                        self.add_fresh_counterparty_backing_unchecked(
+                            domain,
+                            source_backing_num,
+                            expiry_slot,
+                        )?;
+                    } else {
+                        // Past the resolved backing horizon new backing would lapse
+                        // on creation; route it where that expiry would send it.
+                        residual_backing = backing;
+                    }
                 }
             }
             self.credit_post_snapshot_residual_not_atomic(residual_backing)?;
