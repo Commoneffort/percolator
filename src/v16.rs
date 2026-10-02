@@ -14561,6 +14561,29 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             short_kf_changed,
             asset.slot_last,
         )?;
+        // An asset that nobody holds, owes or has left unsettled has nothing to accrue once its
+        // price is at the target: with no exposure the price step goes straight to the target
+        // and no funding is active, so every further bounded call would change `slot_last` and
+        // nothing else. Its clock therefore moves to `now_slot` in this call, after the cohort
+        // epoch above has been taken at the end of the bounded prefix: the resulting state is
+        // the one the remaining calls would produce.
+        let idle = asset.oi_eff_long_q == 0
+            && asset.oi_eff_short_q == 0
+            && asset.stored_pos_count_long == 0
+            && asset.stored_pos_count_short == 0
+            && asset.stale_account_count_long == 0
+            && asset.stale_account_count_short == 0
+            && asset.pending_obligation_count_long == 0
+            && asset.pending_obligation_count_short == 0;
+        let slot_before = asset.slot_last - expected_steps_u64;
+        if idle
+            && expected_steps_u64 != 0
+            && asset.effective_price == raw_oracle_target_price
+            && asset.slot_last < now_slot
+        {
+            asset.slot_last = now_slot;
+        }
+        let advanced = asset.slot_last - slot_before;
         asset.raw_oracle_target_price = raw_oracle_target_price;
         self.set_asset_state(asset_index, asset)?;
         self.header.current_slot = V16PodU64::new(now_slot);
@@ -14584,7 +14607,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         );
         self.validate_shape_audit_scan()?;
         Ok(AccrueAssetOutcomeV16 {
-            dt: expected_steps_u64,
+            dt: advanced,
             price_move_active: price_move_count != 0,
             funding_active: funding_count != 0,
             equity_active: price_move_count != 0 || funding_count != 0,

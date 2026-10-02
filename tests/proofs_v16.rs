@@ -11430,6 +11430,124 @@ fn proof_v16_canonical_accrual_path_is_partition_invariant() {
     ));
 }
 
+/// One call on an asset with no exposure reaches `now_slot`, however large the gap, with the
+/// cohort epoch taken at the end of the bounded prefix exactly as a bounded call leaves it, and
+/// without touching value. Full-state equality with slot-by-slot accrual is checked over
+/// concrete gaps in `v16_idle_asset_accrual_reaches_now_in_one_call_and_matches_slot_by_slot_accrual`.
+#[kani::proof]
+#[kani::unwind(48)]
+#[kani::solver(cadical)]
+fn proof_v16_idle_asset_accrual_reaches_now_in_one_call() {
+    // A gap of one slot is an ordinary bounded call; the catch-up starts at two.
+    let gap: u8 = kani::any();
+    let price_moves: bool = kani::any();
+    kani::assume(gap >= 2);
+    let price_delta_raw: u64 = if price_moves { 3 } else { 0 };
+    let (mut header, mut markets, _) = one_market_view_fixture();
+    header.config.max_accrual_dt_slots = V16PodU64::new(2);
+    header.config.min_funding_lifetime_slots = V16PodU64::new(2);
+    let before = markets[0].engine.asset.try_to_runtime().unwrap();
+    let target = before.effective_price + price_delta_raw;
+    // With no exposure the canonical price step goes straight to the target and carries no
+    // remainder: this is the whole canonical path of an idle asset.
+    let step = AccrualStepV16 {
+        effective_price: target,
+        funding_rate_e9: 0,
+        price_move_remainder_before_bps_num: 0,
+        price_move_remainder_after_bps_num: 0,
+    };
+    let prefix: u64 = 2;
+    let now_slot = before.slot_last + gap as u64;
+    let vault_before = header.vault;
+    let c_tot_before = header.c_tot;
+    let insurance_before = header.insurance;
+    let oracle_epoch_before = header.oracle_epoch.get();
+    let funding_epoch_before = header.funding_epoch.get();
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let residual_before = market.kani_residual();
+    let outcome = market
+        .accrue_asset_path_to_not_atomic(0, now_slot, target, &[step, step], true)
+        .unwrap();
+    let after = market.markets[0].engine.asset.try_to_runtime().unwrap();
+
+    kani::cover!(gap > 2, "idle catch-up proof covers a gap beyond the bounded prefix");
+    kani::cover!(price_moves, "idle catch-up proof covers a price move");
+    kani::cover!(!price_moves, "idle catch-up proof covers an unchanged price");
+    assert_eq!(outcome.dt, gap as u64);
+    assert!(!outcome.price_move_active);
+    assert!(!outcome.funding_active);
+    assert!(!outcome.equity_active);
+    assert!(!outcome.loss_stale_after);
+    assert_eq!(after.slot_last, now_slot);
+    assert_eq!(after.effective_price, target);
+    assert_eq!(after.raw_oracle_target_price, target);
+    assert_eq!(after.fund_px_last, target);
+    let cohort = if price_delta_raw > 0 {
+        before.slot_last + prefix
+    } else {
+        before.kf_epoch_long
+    };
+    assert_eq!(after.kf_epoch_long, cohort);
+    assert_eq!(after.kf_epoch_short, cohort);
+    assert_eq!(after.f_long_num, before.f_long_num);
+    assert_eq!(after.f_short_num, before.f_short_num);
+    assert_eq!(after.oi_eff_long_q, 0);
+    assert_eq!(after.oi_eff_short_q, 0);
+    assert_eq!(market.header.current_slot.get(), now_slot);
+    assert_eq!(market.header.slot_last.get(), now_slot);
+    assert_eq!(market.header.loss_stale_active, 0);
+    assert_eq!(
+        market.header.oracle_epoch.get(),
+        oracle_epoch_before + u64::from(target != before.raw_oracle_target_price)
+    );
+    assert_eq!(market.header.funding_epoch.get(), funding_epoch_before);
+    assert_eq!(market.header.vault, vault_before);
+    assert_eq!(market.header.c_tot, c_tot_before);
+    assert_eq!(market.header.insurance, insurance_before);
+    assert_eq!(market.kani_residual(), residual_before);
+}
+
+/// An asset with exposure is still accrued one bounded prefix at a time: the catch-up applies
+/// to idle assets only.
+#[kani::proof]
+#[kani::unwind(48)]
+#[kani::solver(cadical)]
+fn proof_v16_exposed_asset_accrual_stays_bounded_under_idle_catch_up() {
+    let gap: u8 = kani::any();
+    kani::assume(gap >= 3);
+    let (mut header, mut markets, _) = one_market_view_fixture();
+    header.config.max_accrual_dt_slots = V16PodU64::new(2);
+    header.config.min_funding_lifetime_slots = V16PodU64::new(2);
+    let mut asset = markets[0].engine.asset.try_to_runtime().unwrap();
+    asset.oi_eff_long_q = POS_SCALE;
+    asset.oi_eff_short_q = POS_SCALE;
+    asset.stored_pos_count_long = 1;
+    asset.stored_pos_count_short = 1;
+    asset.loss_weight_sum_long = POS_SCALE;
+    asset.loss_weight_sum_short = POS_SCALE;
+    markets[0].engine.asset = AssetStateV16Account::from_runtime(&asset);
+    let target = asset.effective_price;
+    let step = AccrualStepV16 {
+        effective_price: target,
+        funding_rate_e9: 0,
+        price_move_remainder_before_bps_num: 0,
+        price_move_remainder_after_bps_num: 0,
+    };
+    let now_slot = asset.slot_last + gap as u64;
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let outcome = market
+        .accrue_asset_path_to_not_atomic(0, now_slot, target, &[step, step], true)
+        .unwrap();
+    let after = market.markets[0].engine.asset.try_to_runtime().unwrap();
+
+    assert_eq!(outcome.dt, 2);
+    assert_eq!(after.slot_last, asset.slot_last + 2);
+    assert!(outcome.loss_stale_after);
+    assert_eq!(market.header.loss_stale_active, 1);
+}
+
 #[kani::proof]
 #[kani::unwind(48)]
 #[kani::solver(cadical)]

@@ -1149,6 +1149,114 @@ fn v16_canonical_accrual_path_bounds_long_gap_work_and_remains_actionable() {
     assert_eq!(header.loss_stale_active, 1);
 }
 
+/// The canonical path of an asset with no exposure: the price is at the target after the first
+/// step, and no step carries a remainder.
+fn idle_path(target: u64, count: usize) -> Vec<AccrualStepV16> {
+    (0..count)
+        .map(|_| AccrualStepV16 {
+            effective_price: target,
+            funding_rate_e9: 0,
+            price_move_remainder_before_bps_num: 0,
+            price_move_remainder_after_bps_num: 0,
+        })
+        .collect()
+}
+
+#[test]
+fn v16_idle_asset_accrual_reaches_now_in_one_call_and_matches_slot_by_slot_accrual() {
+    const INITIAL_PRICE: u64 = 1_000_000;
+    for gap in [1u64, 2, 9, 10, 11, 33, 5_000] {
+        for target in [INITIAL_PRICE, INITIAL_PRICE * 2, INITIAL_PRICE / 2] {
+            let (mut one_header, mut one_markets) = canonical_path_market_fixture(INITIAL_PRICE);
+            let (mut stepped_header, mut stepped_markets) =
+                canonical_path_market_fixture(INITIAL_PRICE);
+            let start = one_markets[0].engine.asset.slot_last.get();
+            let initial_cohort = one_markets[0].engine.asset.kf_epoch_long.get();
+            let now = start + gap;
+
+            // One call, with the bounded prefix the wrapper supplies.
+            let outcome = {
+                let mut market = MarketGroupV16ViewMut::new(&mut one_header, &mut one_markets);
+                market
+                    .accrue_asset_path_to_not_atomic(
+                        0,
+                        now,
+                        target,
+                        &idle_path(target, gap.min(10) as usize),
+                        true,
+                    )
+                    .unwrap()
+            };
+            // The reference: one canonical call per slot.
+            {
+                let mut market =
+                    MarketGroupV16ViewMut::new(&mut stepped_header, &mut stepped_markets);
+                for slot in start + 1..=now {
+                    market
+                        .accrue_asset_path_to_not_atomic(0, slot, target, &idle_path(target, 1), true)
+                        .unwrap();
+                }
+            }
+
+            assert_eq!(outcome.dt, gap);
+            assert!(!outcome.equity_active);
+            assert!(!outcome.loss_stale_after);
+            assert_eq!(one_markets[0].engine.asset.slot_last.get(), now);
+            assert_eq!(one_markets[0].engine.asset.effective_price.get(), target);
+            assert_eq!(one_header, stepped_header);
+            // The cohort epoch is the end of the bounded prefix in which the price moved, as it
+            // is for a bounded call today; a one-slot call takes it one slot after the start.
+            let moved = target != INITIAL_PRICE;
+            let cohort = if moved { start + gap.min(10) } else { initial_cohort };
+            assert_eq!(one_markets[0].engine.asset.kf_epoch_long.get(), cohort);
+            assert_eq!(one_markets[0].engine.asset.kf_epoch_short.get(), cohort);
+            let mut reference = stepped_markets[0].engine.asset;
+            reference.kf_epoch_long = one_markets[0].engine.asset.kf_epoch_long;
+            reference.kf_epoch_short = one_markets[0].engine.asset.kf_epoch_short;
+            assert_eq!(one_markets[0].engine.asset, reference);
+        }
+    }
+}
+
+#[test]
+fn v16_asset_with_stored_positions_or_obligations_is_accrued_in_bounded_segments() {
+    const INITIAL_PRICE: u64 = 1_000_000;
+    for case in 0..6 {
+        let (mut header, mut markets) = canonical_path_market_fixture(INITIAL_PRICE);
+        let mut asset = markets[0].engine.asset.try_to_runtime().unwrap();
+        match case {
+            0 => asset.stored_pos_count_long = 1,
+            1 => asset.stored_pos_count_short = 1,
+            2 => {
+                asset.stored_pos_count_long = 1;
+                asset.stale_account_count_long = 1;
+            }
+            3 => {
+                asset.stored_pos_count_short = 1;
+                asset.stale_account_count_short = 1;
+            }
+            4 => asset.pending_obligation_count_long = 1,
+            _ => asset.pending_obligation_count_short = 1,
+        }
+        markets[0].engine.asset = AssetStateV16Account::from_runtime(&asset);
+        let start = asset.slot_last;
+        let outcome = {
+            let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+            market
+                .accrue_asset_path_to_not_atomic(
+                    0,
+                    start + 50,
+                    INITIAL_PRICE,
+                    &idle_path(INITIAL_PRICE, 10),
+                    true,
+                )
+                .unwrap()
+        };
+        assert_eq!(outcome.dt, 10, "case {case}");
+        assert_eq!(markets[0].engine.asset.slot_last.get(), start + 10, "case {case}");
+    }
+}
+
 #[test]
 fn v16_canonical_accrual_path_carries_sub_atom_price_progress_across_calls() {
     let mut price = 100;
