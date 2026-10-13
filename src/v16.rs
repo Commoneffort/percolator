@@ -13210,10 +13210,15 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             return Ok(());
         }
         let unliened_num = Self::slot_unliened_claim_num(source)?;
+        // Whole atoms only, rounded down: a slot's claim can hold a fraction of an
+        // atom (a burn at a partial rate leaves one), and netting the rounded-up
+        // amount would take more claim than the slot has (CounterUnderflow, and the
+        // account could no longer be settled). The fraction stays for the
+        // support-and-burn path.
         let mut netted = batch
             .loss_left
             .min(batch.face_left)
-            .min(V16Core::amount_from_bound_num(unliened_num)?);
+            .min(unliened_num / BOUND_SCALE);
         if netted == 0 {
             return Ok(());
         }
