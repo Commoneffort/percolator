@@ -13383,7 +13383,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             if rate != CREDIT_RATE_SCALE {
                 return Ok(());
             }
-            netted = netted.min(V16Core::amount_from_bound_num(movable_num)?);
+            netted = netted.min(movable_num / BOUND_SCALE);
             if netted == 0 {
                 return Ok(());
             }
