@@ -169,14 +169,14 @@ fn v16_quantity_adl_price_and_funding_accrual_remain_zero_sum() {
     let scaled = (ADL_ONE * 3 / 4) as i128;
     assert_eq!(asset.k_long, ADL_ONE as i128);
     assert_eq!(asset.k_short, -scaled);
+    // Funding is scaled by each side's A before it is rounded: rate x price x A / FUNDING_DEN,
+    // toward minus infinity on both sides (the payer pays at least, the receiver gets at most).
+    let funding_n = FUNDING_COUNTER_RATE_E9 * (FUNDING_COUNTER_PRICE + 1) as i128;
     assert_eq!(
         asset.f_long_num,
-        -(FUNDING_COUNTER_ATOMS_PER_SLOT as i128 * ADL_ONE as i128)
+        exact_funding_index(-funding_n, ADL_ONE as i128)
     );
-    assert_eq!(
-        asset.f_short_num,
-        FUNDING_COUNTER_ATOMS_PER_SLOT as i128 * scaled
-    );
+    assert_eq!(asset.f_short_num, exact_funding_index(funding_n, scaled));
 
     let total_value = |long: &PortfolioAccountV16Account,
                        short: &PortfolioAccountV16Account|
@@ -201,7 +201,11 @@ fn v16_quantity_adl_price_and_funding_accrual_remain_zero_sum() {
             )
             .unwrap();
     }
-    assert_eq!(total_value(&long_header, &short_header), value_before);
+    // Funding is exact to the ADL scale, and settling it rounds each leg toward minus infinity:
+    // the two sides' total can fall by at most one atom per settled leg (dust the market holds and
+    // nobody is owed), and never rise.
+    let dust = value_before - total_value(&long_header, &short_header);
+    assert!((0..=2).contains(&dust), "zero-sum up to conservative rounding dust, got {dust}");
 
     let reduced_asset = markets[0].engine.asset.try_to_runtime().unwrap();
     assert_eq!(reduced_asset.oi_eff_long_q, 6 * POS_SCALE);
@@ -235,10 +239,10 @@ fn v16_quantity_adl_price_and_funding_accrual_remain_zero_sum() {
         market.full_account_refresh_not_atomic(&mut long).unwrap();
         market.full_account_refresh_not_atomic(&mut short).unwrap();
     }
-    assert_eq!(
-        total_value(&long_header, &short_header),
-        value_before_continuation,
-        "future price/funding accrual must remain zero-sum after the partial ADL reduction"
+    let dust = value_before_continuation - total_value(&long_header, &short_header);
+    assert!(
+        (0..=2).contains(&dust),
+        "future price/funding accrual must remain zero-sum after the partial ADL reduction, up to conservative rounding dust: {dust}"
     );
 }
 
@@ -618,12 +622,18 @@ fn v16_canonical_accrual_path_scales_indices_after_quantity_adl() {
     let asset = markets[0].engine.asset.try_to_runtime().unwrap();
     let a_short = ADL_ONE * 3 / 4;
     let price_delta = i128::from(step.effective_price - INITIAL_PRICE);
-    let funding_index_delta = FUNDING_COUNTER_ATOMS_PER_SLOT as i128;
+    let funding_n = step.funding_rate_e9 * step.effective_price as i128;
     assert_eq!(asset.a_short, a_short);
     assert_eq!(asset.k_long, price_delta * ADL_ONE as i128);
     assert_eq!(asset.k_short, -(price_delta * a_short as i128));
-    assert_eq!(asset.f_long_num, -(funding_index_delta * ADL_ONE as i128));
-    assert_eq!(asset.f_short_num, funding_index_delta * a_short as i128);
+    assert_eq!(asset.f_long_num, exact_funding_index(-funding_n, ADL_ONE as i128));
+    assert_eq!(asset.f_short_num, exact_funding_index(funding_n, a_short as i128));
+}
+
+/// One side's funding index delta: `n` (signed rate x dt x price, from that side's point of
+/// view) times its A, over FUNDING_DEN, rounded toward minus infinity.
+fn exact_funding_index(n: i128, a: i128) -> i128 {
+    (n * a).div_euclid(percolator::FUNDING_DEN as i128)
 }
 
 fn account_fixture(market_slots: u32, account_seed: u8) -> PortfolioAccountV16Account {
