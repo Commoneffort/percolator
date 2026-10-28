@@ -51,9 +51,9 @@ use percolator::v16::{
     kani_eq_portfolio_account_v16_account,
 };
 use percolator::{
-    ADL_ONE, BOUND_SCALE, CREDIT_RATE_SCALE, MAX_ACCOUNT_NOTIONAL, MAX_MARGIN_BPS, MAX_OI_SIDE_Q,
-    MAX_ORACLE_PRICE, MAX_POSITION_ABS_Q, MAX_TRADE_SIZE_Q, MAX_VAULT_TVL, MIN_A_SIDE, POS_SCALE,
-    SOCIAL_LOSS_DEN, V16_ACTIVE_BITMAP_WORDS,
+    ADL_ONE, BOUND_SCALE, CREDIT_RATE_SCALE, FUNDING_DEN, MAX_ACCOUNT_NOTIONAL, MAX_MARGIN_BPS,
+    MAX_OI_SIDE_Q, MAX_ORACLE_PRICE, MAX_POSITION_ABS_Q, MAX_TRADE_SIZE_Q, MAX_VAULT_TVL,
+    MIN_A_SIDE, POS_SCALE, SOCIAL_LOSS_DEN, V16_ACTIVE_BITMAP_WORDS,
 };
 
 fn ids() -> ([u8; 32], [u8; 32], [u8; 32]) {
@@ -1591,7 +1591,13 @@ fn proof_v16_adl_scaled_accrual_kernel_matches_every_valid_factor() {
     let a_short = u128::from(a_short_raw);
     let price_delta = i128::from(price_delta_raw);
     let funding_delta = i128::from(funding_delta_raw);
-    let result = kani_adl_scaled_accrual_index_deltas(price_delta, funding_delta, a_long, a_short);
+    // Whole price units of funding: the kernel takes the FUNDING_DEN-scaled numerator.
+    let result = kani_adl_scaled_accrual_index_deltas(
+        price_delta,
+        funding_delta * FUNDING_DEN as i128,
+        a_long,
+        a_short,
+    );
     assert!(result.is_ok());
     let (k_long, k_short, f_long, f_short) = result.unwrap();
 
@@ -1614,6 +1620,48 @@ fn proof_v16_adl_scaled_accrual_kernel_matches_every_valid_factor() {
     assert_eq!(f_short, funding_delta * i128::from(a_short_raw));
 }
 
+// #458: sub-price-unit funding (`|rate * dt * price| < FUNDING_DEN`) is not floored to
+// whole price units before A-scaling. Each side's index delta is the exact A-scaled
+// transfer floored once: the payer's index falls by at least the exact amount, the
+// receiver's rises by at most it, each within one F unit, so the cross-side value
+// mismatch is below one F unit per accrual and never favours either side.
+#[kani::proof]
+#[kani::unwind(4)]
+#[kani::solver(cadical)]
+fn proof_v16_sub_unit_funding_accrual_is_exact_and_conservative() {
+    // Tractable domain: every ADL factor quantum `MIN_A_SIDE..=ADL_ONE` step and a
+    // symbolic sub-unit numerator (|funding_num| <= 128 < FUNDING_DEN); wider symbolic
+    // 128-bit divisions are intractable for CBMC.
+    let a_long_units: u8 = kani::any();
+    let a_short_units: u8 = kani::any();
+    let funding_num_raw: i8 = kani::any();
+    kani::assume((1..=10).contains(&a_long_units));
+    kani::assume((1..=10).contains(&a_short_units));
+    assert_eq!(ADL_ONE, 10 * MIN_A_SIDE);
+    let funding_num = i128::from(funding_num_raw);
+    let a_long = i128::from(a_long_units) * MIN_A_SIDE as i128;
+    let a_short = i128::from(a_short_units) * MIN_A_SIDE as i128;
+    let (k_long, k_short, f_long, f_short) =
+        kani_adl_scaled_accrual_index_deltas(0, funding_num, a_long as u128, a_short as u128)
+            .unwrap();
+    kani::cover!(
+        funding_num > 0 && f_short > 0,
+        "positive sub-unit funding accrues"
+    );
+    kani::cover!(
+        funding_num < 0 && f_long > 0,
+        "negative sub-unit funding accrues"
+    );
+    assert_eq!(k_long, 0);
+    assert_eq!(k_short, 0);
+    let den = FUNDING_DEN as i128;
+    // f * den <= exact < (f + 1) * den for each side (floor of the exact quotient).
+    let exact_long = -funding_num * a_long;
+    let exact_short = funding_num * a_short;
+    assert!(f_long * den <= exact_long && exact_long < (f_long + 1) * den);
+    assert!(f_short * den <= exact_short && exact_short < (f_short + 1) * den);
+}
+
 #[kani::proof]
 #[kani::unwind(4)]
 #[kani::solver(cadical)]
@@ -1632,7 +1680,7 @@ fn proof_v16_adl_scaled_accrual_is_cross_side_zero_sum_at_every_factor_quantum()
     let a_short = u128::from(a_short_units) * MIN_A_SIDE;
     let (k_long, k_short, f_long, f_short) = kani_adl_scaled_accrual_index_deltas(
         i128::from(price_delta_raw),
-        i128::from(funding_delta_raw),
+        i128::from(funding_delta_raw) * FUNDING_DEN as i128,
         a_long,
         a_short,
     )
@@ -1715,9 +1763,13 @@ fn proof_v16_adl_kf_settlement_is_account_partition_invariant_and_zero_sum() {
     let a_short = u128::from(a_short_units) * a_quantum;
     let price_units = i128::from(price_units_raw);
     let funding_units = i128::from(funding_units_raw);
-    let (k_long, k_short, f_long, f_short) =
-        kani_adl_scaled_accrual_index_deltas(4 * price_units, 4 * funding_units, a_long, a_short)
-            .unwrap();
+    let (k_long, k_short, f_long, f_short) = kani_adl_scaled_accrual_index_deltas(
+        4 * price_units,
+        4 * funding_units * FUNDING_DEN as i128,
+        a_long,
+        a_short,
+    )
+    .unwrap();
 
     let (mut header, mut markets) = one_market_only_fixture();
     let mut asset = markets[0].engine.asset.try_to_runtime().unwrap();
@@ -10596,6 +10648,95 @@ fn proof_v16_resolved_receipt_claimable_is_rate_monotone_and_overpaid_fails_clos
     }
 }
 
+// Two top-ups, one before and one after a post-snapshot release raises the
+// common rate, pay exactly one top-up at the final rate. The bounds (face and
+// other claims <= 16, residual and release <= 32) are for solver time, not
+// u128 range.
+#[kani::proof]
+#[kani::unwind(16)]
+#[kani::solver(cadical)]
+fn proof_v16_resolved_split_topups_pay_exactly_one_topup_at_final_rate() {
+    let face_raw: u8 = kani::any();
+    let other_raw: u8 = kani::any();
+    let residual_raw: u8 = kani::any();
+    let released_raw: u8 = kani::any();
+    kani::assume((1..=16).contains(&face_raw));
+    kani::assume(other_raw <= 16);
+    kani::assume(residual_raw <= 32);
+    kani::assume(released_raw <= 32);
+
+    let face = face_raw as u128;
+    let other = other_raw as u128;
+    let residual = residual_raw as u128;
+    let released = released_raw as u128;
+    let (before, legacy) = MarketGroupV16ViewMut::<u64>::kani_kernel_credit_post_snapshot_residual(
+        ResolvedPayoutLedgerV16 {
+            snapshot_residual: residual,
+            terminal_claim_exact_receipts_num: face * BOUND_SCALE,
+            terminal_claim_bound_unreceipted_num: other * BOUND_SCALE,
+            snapshot_slot: 1,
+            ..ResolvedPayoutLedgerV16::EMPTY
+        },
+        residual,
+        0,
+    )
+    .unwrap();
+    let (after, legacy_after) =
+        MarketGroupV16ViewMut::<u64>::kani_kernel_credit_post_snapshot_residual(
+            before, legacy, released,
+        )
+        .unwrap();
+    let receipt = resolved_payout_receipt_for_proof(face, 0);
+
+    let first = MarketGroupV16ViewMut::<u64>::kani_resolved_receipt_claimable_against_ledger(
+        receipt, before,
+    )
+    .unwrap();
+    let receipt_1 = kani_apply_resolved_payout_receipt_payment(receipt, first).unwrap();
+    let second = MarketGroupV16ViewMut::<u64>::kani_resolved_receipt_claimable_against_ledger(
+        receipt_1, after,
+    )
+    .unwrap();
+    let receipt_2 = kani_apply_resolved_payout_receipt_payment(receipt_1, second).unwrap();
+    let replay = MarketGroupV16ViewMut::<u64>::kani_resolved_receipt_claimable_against_ledger(
+        receipt_2, after,
+    )
+    .unwrap();
+    let single = MarketGroupV16ViewMut::<u64>::kani_resolved_receipt_claimable_against_ledger(
+        receipt, after,
+    )
+    .unwrap();
+
+    kani::cover!(
+        first > 0 && second > 0,
+        "both top-ups pay across a strict rate rise"
+    );
+    kani::cover!(
+        first == 0 && second > 0,
+        "a receipt worth nothing at the old rate is paid after the rise"
+    );
+    kani::cover!(
+        released > 0 && first == face,
+        "a release past full funding pays no second top-up"
+    );
+    kani::cover!(receipt_2.finalized, "split top-ups finalize the receipt");
+    assert_eq!(legacy_after, residual + released);
+    assert_eq!(
+        after.current_payout_rate_den,
+        before.current_payout_rate_den
+    );
+    assert!(after.current_payout_rate_num >= before.current_payout_rate_num);
+    assert_eq!(first + second, single);
+    assert_eq!(receipt_2.paid_effective, single);
+    assert!(single <= face);
+    assert_eq!(receipt_2.finalized, single == face);
+    assert_eq!(replay, 0);
+    assert_eq!(
+        kani_apply_resolved_payout_receipt_payment(receipt_2, replay),
+        Ok(receipt_2)
+    );
+}
+
 #[kani::proof]
 #[kani::unwind(40)]
 #[kani::solver(cadical)]
@@ -10849,6 +10990,84 @@ fn proof_v16_two_resolved_receipts_are_order_independent_when_snapshot_funded() 
         assert_eq!(pay_b2, cb);
         assert_eq!(a_after1.paid_effective, a_after2.paid_effective);
         assert_eq!(b_after1.paid_effective, b_after2.paid_effective);
+    }
+}
+
+// Gross entitlements at the common rate sum to at most the snapshot residual and
+// never exceed a face, even with an overstated unreceipted bound; with exact
+// bounds only floor residue remains. released = 0 is the production recompute.
+// Faces <= 16 and slack <= 4 are for solver time, not u128 range.
+#[kani::proof]
+#[kani::unwind(16)]
+#[kani::solver(cadical)]
+fn proof_v16_resolved_payout_rate_never_pays_more_than_snapshot_residual() {
+    let a_raw: u8 = kani::any();
+    let b_raw: u8 = kani::any();
+    let c_raw: u8 = kani::any();
+    let slack_raw: u8 = kani::any();
+    let residual_raw: u8 = kani::any();
+    kani::assume(a_raw <= 16);
+    kani::assume(b_raw <= 16);
+    kani::assume(c_raw <= 16);
+    kani::assume(slack_raw <= 4);
+
+    let a = a_raw as u128;
+    let b = b_raw as u128;
+    let c = c_raw as u128;
+    let slack = slack_raw as u128;
+    let residual = residual_raw as u128;
+    let (ledger, _) = MarketGroupV16ViewMut::<u64>::kani_kernel_credit_post_snapshot_residual(
+        ResolvedPayoutLedgerV16 {
+            snapshot_residual: residual,
+            terminal_claim_exact_receipts_num: (a + b) * BOUND_SCALE,
+            terminal_claim_bound_unreceipted_num: (c + slack) * BOUND_SCALE,
+            snapshot_slot: 1,
+            ..ResolvedPayoutLedgerV16::EMPTY
+        },
+        residual,
+        0,
+    )
+    .unwrap();
+    let gross = |face: u128| {
+        MarketGroupV16ViewMut::<u64>::kani_resolved_receipt_claimable_against_ledger(
+            resolved_payout_receipt_for_proof(face, 0),
+            ledger,
+        )
+        .unwrap()
+    };
+    let gross_a = gross(a);
+    let gross_b = gross(b);
+    let gross_c = gross(c);
+    let total_face = a + b + c;
+    let paid = gross_a + gross_b + gross_c;
+
+    kani::cover!(
+        slack == 0 && residual < total_face && paid < residual,
+        "haircut snapshot leaves floor residue"
+    );
+    kani::cover!(
+        slack == 0 && residual > total_face && total_face > 0,
+        "funded snapshot pays every face and leaves surplus"
+    );
+    kani::cover!(
+        slack > 0 && c > 0 && gross_c < c && residual >= total_face,
+        "overstated unreceipted bound lowers the common rate"
+    );
+    kani::cover!(
+        a > 0 && b > 0 && c > 0 && gross_a != gross_b,
+        "three distinct claimants share one rate"
+    );
+    assert!(ledger.current_payout_rate_num <= ledger.current_payout_rate_den);
+    assert!(gross_a <= a);
+    assert!(gross_b <= b);
+    assert!(gross_c <= c);
+    assert!(paid <= residual);
+    if slack == 0 {
+        if residual >= total_face {
+            assert_eq!((gross_a, gross_b, gross_c), (a, b, c));
+        } else {
+            assert!(residual - paid < 3);
+        }
     }
 }
 
@@ -13143,6 +13362,195 @@ fn proof_v16_counterparty_lien_consume_delta_is_receivable_exact_and_fail_closed
     } else {
         assert_eq!(result, Err(V16Error::CounterUnderflow));
     }
+}
+
+// Every counterparty lien and backing step (create, terminal release, consume,
+// impaired retirement, expiry, top-up, withdrawal) moves the bucket and source
+// aggregate in lockstep, so the coupling validate_source_domain_ledger_parts
+// enforces is inductive. Fields are full-width u128 bounded only by the coupling.
+#[kani::proof]
+#[kani::unwind(4)]
+#[kani::solver(cadical)]
+fn proof_v16_counterparty_lien_lifecycle_preserves_bucket_source_coupling() {
+    let op: u8 = kani::any();
+    let status_raw: u8 = kani::any();
+    let unliened: u128 = kani::any();
+    let valid: u128 = kani::any();
+    let consumed: u128 = kani::any();
+    let impaired: u128 = kani::any();
+    let amount: u128 = kani::any();
+    let current_slot: u64 = kani::any();
+    let topup_expiry: u64 = kani::any();
+    kani::assume(op <= 6);
+    kani::assume(status_raw <= 3);
+    let fresh_reserved = unliened.checked_add(valid);
+    kani::assume(fresh_reserved.is_some());
+
+    let bucket = BackingBucketV16 {
+        market_id: kani::any(),
+        fresh_unliened_backing_num: unliened,
+        valid_liened_backing_num: valid,
+        consumed_liened_backing_num: consumed,
+        impaired_liened_backing_num: impaired,
+        utilization_fee_earnings: kani::any(),
+        expiry_slot: kani::any(),
+        status: match status_raw {
+            0 => BackingBucketStatusV16::Empty,
+            1 => BackingBucketStatusV16::Fresh,
+            2 => BackingBucketStatusV16::Expired,
+            _ => BackingBucketStatusV16::Impaired,
+        },
+    };
+    let source = SourceCreditStateV16 {
+        positive_claim_bound_num: kani::any(),
+        exact_positive_claim_num: kani::any(),
+        fresh_reserved_backing_num: fresh_reserved.unwrap(),
+        spent_backing_num: kani::any(),
+        provider_receivable_num: consumed,
+        valid_liened_backing_num: valid,
+        impaired_liened_backing_num: impaired,
+        insurance_credit_reserved_num: kani::any(),
+        valid_liened_insurance_num: kani::any(),
+        impaired_liened_insurance_num: kani::any(),
+        credit_rate_num: kani::any(),
+        credit_epoch: kani::any(),
+    };
+    let result = match op {
+        0 => MarketGroupV16ViewMut::<u64>::kani_prepare_counterparty_lien_create_delta(
+            bucket,
+            source,
+            current_slot,
+            amount,
+        ),
+        1 => MarketGroupV16ViewMut::<u64>::kani_prepare_counterparty_lien_terminal_release_delta(
+            bucket, source, amount,
+        ),
+        2 => MarketGroupV16ViewMut::<u64>::kani_prepare_counterparty_lien_consume_delta(
+            bucket, source, amount,
+        ),
+        3 => {
+            MarketGroupV16ViewMut::<u64>::kani_prepare_counterparty_impaired_lien_retirement_delta(
+                bucket, source, amount,
+            )
+        }
+        4 => MarketGroupV16ViewMut::<u64>::kani_prepare_counterparty_backing_expiry_delta(
+            bucket,
+            source,
+            current_slot,
+        ),
+        5 => MarketGroupV16ViewMut::<u64>::kani_prepare_counterparty_backing_add_delta(
+            bucket,
+            source,
+            amount,
+            current_slot,
+            topup_expiry,
+        ),
+        _ => MarketGroupV16ViewMut::<u64>::kani_prepare_counterparty_backing_withdraw_delta(
+            bucket, source, amount,
+        ),
+    };
+
+    kani::cover!(
+        op == 0 && amount > 0 && result.is_ok(),
+        "lien coupling covers create"
+    );
+    kani::cover!(
+        op == 1 && amount > 0 && result.is_ok(),
+        "lien coupling covers terminal release"
+    );
+    kani::cover!(
+        op == 2 && amount > 0 && result.is_ok(),
+        "lien coupling covers consume"
+    );
+    kani::cover!(
+        op == 3 && amount > 0 && result.is_ok(),
+        "lien coupling covers impaired retirement"
+    );
+    kani::cover!(
+        op == 4 && unliened > 0 && valid > 0 && result.is_ok(),
+        "lien coupling covers expiry of mixed backing"
+    );
+    kani::cover!(
+        op == 5 && consumed > 0 && amount > 0 && result.is_ok(),
+        "lien coupling covers a top-up that refills receivable"
+    );
+    kani::cover!(
+        op == 6 && amount > 0 && result.is_ok(),
+        "lien coupling covers principal withdrawal"
+    );
+    let (bucket_after, source_after) = match result {
+        Ok(pair) => pair,
+        Err(_) => return,
+    };
+    assert_eq!(
+        Some(source_after.fresh_reserved_backing_num),
+        bucket_after
+            .fresh_unliened_backing_num
+            .checked_add(bucket_after.valid_liened_backing_num)
+    );
+    assert_eq!(
+        source_after.valid_liened_backing_num,
+        bucket_after.valid_liened_backing_num
+    );
+    assert_eq!(
+        source_after.impaired_liened_backing_num,
+        bucket_after.impaired_liened_backing_num
+    );
+    assert_eq!(
+        source_after.provider_receivable_num,
+        bucket_after.consumed_liened_backing_num
+    );
+    let classes = |b: BackingBucketV16| {
+        (
+            b.fresh_unliened_backing_num,
+            b.valid_liened_backing_num,
+            b.consumed_liened_backing_num,
+            b.impaired_liened_backing_num,
+        )
+    };
+    let expected = match op {
+        0 => (unliened - amount, valid + amount, consumed, impaired),
+        1 => (unliened + amount, valid - amount, consumed, impaired),
+        2 => (unliened, valid - amount, consumed + amount, impaired),
+        3 => (unliened, valid, consumed, impaired - amount),
+        4 => (0, 0, consumed, impaired + valid),
+        5 => (
+            unliened + amount,
+            valid,
+            consumed - amount.min(consumed),
+            impaired,
+        ),
+        _ => (unliened - amount, valid, consumed, impaired),
+    };
+    assert_eq!(classes(bucket_after), expected);
+    assert!(source_after.spent_backing_num >= source.spent_backing_num);
+    assert_eq!(bucket_after.market_id, bucket.market_id);
+    assert_eq!(
+        bucket_after.utilization_fee_earnings,
+        bucket.utilization_fee_earnings
+    );
+    assert_eq!(
+        source_after.positive_claim_bound_num,
+        source.positive_claim_bound_num
+    );
+    assert_eq!(
+        source_after.exact_positive_claim_num,
+        source.exact_positive_claim_num
+    );
+    assert_eq!(
+        source_after.insurance_credit_reserved_num,
+        source.insurance_credit_reserved_num
+    );
+    assert_eq!(
+        source_after.valid_liened_insurance_num,
+        source.valid_liened_insurance_num
+    );
+    assert_eq!(
+        source_after.impaired_liened_insurance_num,
+        source.impaired_liened_insurance_num
+    );
+    assert_eq!(source_after.credit_rate_num, source.credit_rate_num);
+    assert_eq!(source_after.credit_epoch, source.credit_epoch);
 }
 
 #[kani::proof]
@@ -16983,6 +17391,121 @@ fn proof_v16_backing_expiry_kernel_rejects_every_ineligible_bucket() {
         "Impaired replay is rejected"
     );
     assert_eq!(result, Err(V16Error::Stale));
+}
+
+// Expiry is a normalization, not a funding event, even when the source domain
+// also carries insurance, liens, receivable history and claims. Slots are
+// full-width. Amounts are whole atoms up to 15 each: the two credit-rate
+// divisions push u8 amounts past the 900s budget.
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::solver(cadical)]
+fn proof_v16_backing_expiry_never_raises_available_backing_or_credit_rate() {
+    let unliened_raw: u8 = kani::any();
+    let liened_raw: u8 = kani::any();
+    let impaired_raw: u8 = kani::any();
+    let insurance_reserved_raw: u8 = kani::any();
+    let insurance_valid_raw: u8 = kani::any();
+    let insurance_impaired_raw: u8 = kani::any();
+    let claim_raw: u8 = kani::any();
+    let exact_raw: u8 = kani::any();
+    let receivable_raw: u8 = kani::any();
+    let spent_raw: u8 = kani::any();
+    let expiry_slot: u64 = kani::any();
+    let now_slot: u64 = kani::any();
+    kani::assume(
+        insurance_valid_raw as u16 + insurance_impaired_raw as u16 <= insurance_reserved_raw as u16,
+    );
+    kani::assume(unliened_raw <= 15 && liened_raw <= 15 && impaired_raw <= 15);
+    kani::assume(insurance_reserved_raw <= 15 && claim_raw <= 15);
+    kani::assume(exact_raw <= claim_raw);
+    kani::assume(receivable_raw <= spent_raw && spent_raw <= 15);
+
+    let unliened = unliened_raw as u128 * BOUND_SCALE;
+    let liened = liened_raw as u128 * BOUND_SCALE;
+    let impaired = impaired_raw as u128 * BOUND_SCALE;
+    let bucket = BackingBucketV16 {
+        market_id: 1,
+        fresh_unliened_backing_num: unliened,
+        valid_liened_backing_num: liened,
+        impaired_liened_backing_num: impaired,
+        consumed_liened_backing_num: receivable_raw as u128 * BOUND_SCALE,
+        expiry_slot,
+        status: BackingBucketStatusV16::Fresh,
+        ..BackingBucketV16::EMPTY
+    };
+    let source = SourceCreditStateV16 {
+        positive_claim_bound_num: claim_raw as u128 * BOUND_SCALE,
+        exact_positive_claim_num: exact_raw as u128 * BOUND_SCALE,
+        fresh_reserved_backing_num: unliened + liened,
+        valid_liened_backing_num: liened,
+        impaired_liened_backing_num: impaired,
+        insurance_credit_reserved_num: insurance_reserved_raw as u128 * BOUND_SCALE,
+        valid_liened_insurance_num: insurance_valid_raw as u128 * BOUND_SCALE,
+        impaired_liened_insurance_num: insurance_impaired_raw as u128 * BOUND_SCALE,
+        credit_rate_num: CREDIT_RATE_SCALE,
+        credit_epoch: 1,
+        spent_backing_num: spent_raw as u128 * BOUND_SCALE,
+        provider_receivable_num: receivable_raw as u128 * BOUND_SCALE,
+        ..SourceCreditStateV16::EMPTY
+    };
+    let available_before = kani_available_backing_num_for_source_credit_state(source).unwrap();
+    let rate_before = kani_expected_source_credit_rate_num_for_state(source).unwrap();
+    let result = MarketGroupV16ViewMut::<u64>::kani_prepare_counterparty_backing_expiry_delta(
+        bucket, source, now_slot,
+    );
+
+    kani::cover!(
+        expiry_slot > 0 && now_slot == expiry_slot - 1,
+        "one slot before expiry"
+    );
+    kani::cover!(now_slot == expiry_slot && unliened > 0, "exact expiry slot");
+    kani::cover!(
+        expiry_slot < u64::MAX && now_slot == expiry_slot + 1 && liened > 0,
+        "one slot after expiry"
+    );
+    kani::cover!(
+        now_slot >= expiry_slot && unliened > 0 && claim_raw > 0 && insurance_reserved_raw > 0,
+        "expiry under live claims and insurance credit"
+    );
+    if now_slot < expiry_slot {
+        assert_eq!(result, Err(V16Error::Stale));
+        return;
+    }
+    let (bucket_after, source_after) = result.unwrap();
+    let available_after = kani_available_backing_num_for_source_credit_state(source_after).unwrap();
+    let rate_after = kani_expected_source_credit_rate_num_for_state(source_after).unwrap();
+    assert_eq!(available_after, available_before - unliened);
+    assert!(rate_after <= rate_before);
+    kani::cover!(
+        rate_after < rate_before,
+        "expiry strictly lowers the credit rate"
+    );
+    kani::cover!(
+        rate_before > 0 && rate_before < CREDIT_RATE_SCALE,
+        "haircut rate before expiry"
+    );
+    kani::cover!(claim_raw == 0, "zero claim keeps the full rate");
+    assert_eq!(source_after.impaired_liened_backing_num, impaired + liened);
+    assert_eq!(bucket_after.impaired_liened_backing_num, impaired + liened);
+    assert_eq!(source_after.fresh_reserved_backing_num, 0);
+    assert_eq!(source_after.valid_liened_backing_num, 0);
+    assert_eq!(bucket_after.fresh_unliened_backing_num, 0);
+    assert_eq!(bucket_after.valid_liened_backing_num, 0);
+    assert_eq!(
+        SourceCreditStateV16 {
+            fresh_reserved_backing_num: source.fresh_reserved_backing_num,
+            valid_liened_backing_num: source.valid_liened_backing_num,
+            impaired_liened_backing_num: source.impaired_liened_backing_num,
+            ..source_after
+        },
+        source
+    );
+    if impaired + liened == 0 {
+        assert_eq!(bucket_after.status, BackingBucketStatusV16::Expired);
+    } else {
+        assert_eq!(bucket_after.status, BackingBucketStatusV16::Impaired);
+    }
 }
 
 #[kani::proof]
