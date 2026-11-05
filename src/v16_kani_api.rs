@@ -1660,6 +1660,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             true,
             long_attributable_asset_before_refresh,
             short_attributable_asset_before_refresh,
+            false,
         )?;
         Ok((out.fee_a, out.fee_b, out.notional, out.risk_increasing))
     }
