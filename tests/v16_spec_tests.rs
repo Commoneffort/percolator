@@ -14766,3 +14766,100 @@ fn v16_netting_never_rounds_a_fractional_source_claim_past_its_slot() {
     assert!(out.senior_surplus >= 0, "{out:?}");
 }
 
+
+// ---- Fork (Turbopump, 2026-11-05): cohort-tolerant trades ----
+
+/// A market with a winner/loser pair after a price move, the winner settled and the loser
+/// still stale: the setup of `v16_fully_accrued_kf_cohort_blocks_fresh_risk_until_every_side_settles`.
+fn stale_loser_fixture() -> (
+    MarketGroupV16HeaderAccount,
+    Vec<Market<u64>>,
+    PortfolioAccountV16Account,
+    PortfolioAccountV16Account,
+    PortfolioAccountV16Account,
+) {
+    let (mut header, mut markets) = market_fixture(1, 100);
+    let mut winner_header = account_fixture(1, 221);
+    let mut loser_header = account_fixture(1, 222);
+    let mut entrant_header = account_fixture(1, 223);
+    {
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        let mut winner = PortfolioV16ViewMut::new(&mut winner_header);
+        let mut loser = PortfolioV16ViewMut::new(&mut loser_header);
+        let mut entrant = PortfolioV16ViewMut::new(&mut entrant_header);
+        for account in [&mut winner, &mut loser, &mut entrant] {
+            market.deposit_not_atomic(account, 10_000).unwrap();
+        }
+        market
+            .execute_trade_with_fee_loss_stale_scoped_not_atomic(
+                &mut winner,
+                &mut loser,
+                TradeRequestV16 { asset_index: 0, size_q: signed_q(POS_SCALE), exec_price: 100, fee_bps: 0 },
+            )
+            .unwrap();
+        market.accrue_asset_to_not_atomic(0, 2, 101, 0, true).unwrap();
+        market.markets[0].engine.asset.raw_oracle_target_price = V16PodU64::new(101);
+        market.full_account_refresh_not_atomic(&mut winner).unwrap();
+        let a = market.markets[0].engine.asset.try_to_runtime().unwrap();
+        assert_eq!((a.stale_account_count_long, a.stale_account_count_short), (0, 1));
+    }
+    (header, markets, winner_header, loser_header, entrant_header)
+}
+
+#[test]
+fn fork_cohort_tolerant_trade_opens_risk_while_another_account_is_stale() {
+    let (mut header, mut markets, mut winner_header, mut loser_header, mut entrant_header) = stale_loser_fixture();
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut winner = PortfolioV16ViewMut::new(&mut winner_header);
+    let mut loser = PortfolioV16ViewMut::new(&mut loser_header);
+    let mut entrant = PortfolioV16ViewMut::new(&mut entrant_header);
+    let request = TradeRequestV16 { asset_index: 0, size_q: signed_q(POS_SCALE), exec_price: 101, fee_bps: 0 };
+    // The ordinary path still refuses...
+    assert_eq!(market.execute_trade_with_fee_loss_stale_scoped_not_atomic(&mut entrant, &mut winner, request), Err(V16Error::LockActive));
+    // ...the cohort-tolerant one opens it.
+    market.execute_trade_with_fee_cohort_tolerant_not_atomic(&mut entrant, &mut winner, request).expect("cohort-tolerant open");
+    assert_ne!(entrant.header.active_bitmap[0].get(), 0);
+    // The loser is still stale and its cohort is still counted; the market stays loss-stale.
+    let a = market.markets[0].engine.asset.try_to_runtime().unwrap();
+    assert_eq!(a.stale_account_count_short, 1);
+    assert!(market.header.loss_stale_active != 0);
+    market.validate_shape().unwrap();
+    // The loser settles later, at the same move: the cohort empties exactly.
+    market.full_account_refresh_not_atomic(&mut loser).unwrap();
+    let a = market.markets[0].engine.asset.try_to_runtime().unwrap();
+    assert_eq!((a.stale_account_count_long, a.stale_account_count_short), (0, 0));
+    market.validate_shape().unwrap();
+    for acc in [&winner, &loser, &entrant] {
+        acc.validate_with_market(&market.as_view()).unwrap();
+    }
+}
+
+#[test]
+fn fork_cohort_tolerant_trade_still_needs_the_asset_accrued_to_now() {
+    let (mut header, mut markets, mut winner_header, _loser_header, mut entrant_header) = stale_loser_fixture();
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut winner = PortfolioV16ViewMut::new(&mut winner_header);
+    let mut entrant = PortfolioV16ViewMut::new(&mut entrant_header);
+    // The clock moves on and the asset is not accrued to it.
+    market.header.current_slot = V16PodU64::new(market.header.current_slot.get() + 1);
+    let request = TradeRequestV16 { asset_index: 0, size_q: signed_q(POS_SCALE), exec_price: 101, fee_bps: 0 };
+    assert!(market.execute_trade_with_fee_cohort_tolerant_not_atomic(&mut entrant, &mut winner, request).is_err());
+    assert_eq!(entrant.header.active_bitmap[0].get(), 0);
+}
+
+#[test]
+fn fork_cohort_tolerant_trade_with_a_stale_counterparty_settles_it_inline() {
+    // The stale account itself trading (here the loser adding to its short) is settled inline as
+    // in any trade, and that discharges its cohort membership.
+    let (mut header, mut markets, _winner_header, mut loser_header, mut entrant_header) = stale_loser_fixture();
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut loser = PortfolioV16ViewMut::new(&mut loser_header);
+    let mut entrant = PortfolioV16ViewMut::new(&mut entrant_header);
+    let request = TradeRequestV16 { asset_index: 0, size_q: signed_q(POS_SCALE), exec_price: 101, fee_bps: 0 };
+    market.execute_trade_with_fee_cohort_tolerant_not_atomic(&mut entrant, &mut loser, request).expect("open against the stale account");
+    let a = market.markets[0].engine.asset.try_to_runtime().unwrap();
+    assert_eq!((a.stale_account_count_long, a.stale_account_count_short), (0, 0));
+    market.validate_shape().unwrap();
+    loser.validate_with_market(&market.as_view()).unwrap();
+    entrant.validate_with_market(&market.as_view()).unwrap();
+}

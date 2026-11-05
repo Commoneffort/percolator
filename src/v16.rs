@@ -17200,6 +17200,14 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         ))
     }
 
+    /// The part of `asset_is_loss_stale` that is about the asset itself (accrual behind the
+    /// current slot), not about other accounts' stale cohorts on it.
+    fn asset_is_slot_lag_loss_stale(&self, asset_index: usize) -> V16Result<bool> {
+        let asset = self.asset_state(asset_index)?;
+        Ok(asset_contributes_to_loss_stale_summary(asset)
+            && asset.slot_last < self.header.current_slot.get())
+    }
+
     fn account_has_loss_stale_live_leg(&self, account: &PortfolioV16View<'_>) -> V16Result<bool> {
         let bitmap = account.header.active_bitmap.map(V16PodU64::get);
         let mut slot = 0usize;
@@ -17306,6 +17314,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         request: TradeRequestV16,
         long_lookup: PositionDeltaLookupV16,
         short_lookup: PositionDeltaLookupV16,
+        cohort_tolerant: bool,
     ) -> V16Result<TradePositionPreflightV16> {
         Self::trade_signed_size_deltas(request.size_q)?;
         let long_risk_increasing = long_lookup.next_effective_q.unsigned_abs()
@@ -17346,9 +17355,17 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                 short_lookup.current_effective_q,
                 short_lookup.next_effective_q,
             );
+        // A cohort-tolerant trade (`execute_trade_with_fee_cohort_tolerant_not_atomic`) is not
+        // held back by other accounts' stale K/F cohorts on the asset: only by the asset itself
+        // being behind the current slot. Both trading accounts were settled above.
+        let asset_loss_stale = if cohort_tolerant {
+            self.asset_is_slot_lag_loss_stale(request.asset_index)?
+        } else {
+            self.asset_is_loss_stale(request.asset_index)?
+        };
         trade_preflight_risk_gate(
             risk_increasing,
-            self.asset_is_loss_stale(request.asset_index)?,
+            asset_loss_stale,
             target_effective_lag,
             blocked_by_pending_domain_barrier,
         )?;
@@ -18889,6 +18906,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         is_final_batch_fill: bool,
         long_attributable_asset_before_refresh: Option<usize>,
         short_attributable_asset_before_refresh: Option<usize>,
+        cohort_tolerant: bool,
     ) -> V16Result<TradeApplyOutcomeV16> {
         let (abs_size_q, _, _) = Self::trade_signed_size_deltas(request.size_q)?;
         let trade_preflight = self.validate_trade_position_preflight(
@@ -18897,6 +18915,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             request,
             position_lookups.0,
             position_lookups.1,
+            cohort_tolerant,
         )?;
         let risk_increasing = trade_preflight.risk_increasing;
         self.require_asset_risk_change_allowed(request.asset_index, risk_increasing)?;
@@ -19126,6 +19145,47 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         short_account: &mut PortfolioV16ViewMut<'_>,
         requests: &[TradeRequestV16],
     ) -> V16Result<BatchTradeOutcomeV16> {
+        self.execute_batch_with_fee_scoped_inner_not_atomic(long_account, short_account, requests, false)
+    }
+
+    /// Fork addition (Turbopump, 2026-11-05; not upstream). A trade that is not held back by
+    /// other accounts' stale K/F cohorts on its asset: the two trading accounts are settled
+    /// inline as in every trade, and the asset itself must be accrued to the current slot, but
+    /// a risk increase no longer waits for every other position on the asset to be re-valued.
+    /// Everything else is unchanged; in particular the market stays loss-stale, so neither
+    /// account's positive PnL supports the trade while other accounts are stale.
+    ///
+    /// The caller decides when this is safe. The risk it takes is that a stale account is
+    /// already bankrupt and its deficit is socialized after this trade, onto positions opened
+    /// meanwhile. The wrapper only uses it when the LP's matcher asks for it
+    /// (`FLAG_COHORT_TOLERANT`), and Turbopump's router asks only while the price has stayed
+    /// within a fraction of the maintenance margin since every account was last current.
+    pub fn execute_trade_with_fee_cohort_tolerant_not_atomic(
+        &mut self,
+        long_account: &mut PortfolioV16ViewMut<'_>,
+        short_account: &mut PortfolioV16ViewMut<'_>,
+        request: TradeRequestV16,
+    ) -> V16Result<TradeOutcomeV16> {
+        let outcome = self.execute_batch_with_fee_scoped_inner_not_atomic(
+            long_account,
+            short_account,
+            core::slice::from_ref(&request),
+            true,
+        )?;
+        Ok(TradeOutcomeV16 {
+            fee_a: outcome.fee_a,
+            fee_b: outcome.fee_b,
+            notional: outcome.notional,
+        })
+    }
+
+    fn execute_batch_with_fee_scoped_inner_not_atomic(
+        &mut self,
+        long_account: &mut PortfolioV16ViewMut<'_>,
+        short_account: &mut PortfolioV16ViewMut<'_>,
+        requests: &[TradeRequestV16],
+        cohort_tolerant: bool,
+    ) -> V16Result<BatchTradeOutcomeV16> {
         self.validate_unconfigured_market_tail()?;
         let mut ignore_unrelated_loss_stale =
             decode_bool(self.header.loss_stale_active)? && !requests.is_empty();
@@ -19151,6 +19211,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             long_account,
             short_account,
             requests,
+            cohort_tolerant,
         );
         if ignore_unrelated_loss_stale {
             self.header.loss_stale_active = restore_loss_stale_active;
@@ -19167,6 +19228,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         long_account: &mut PortfolioV16ViewMut<'_>,
         short_account: &mut PortfolioV16ViewMut<'_>,
         requests: &[TradeRequestV16],
+        cohort_tolerant: bool,
     ) -> V16Result<BatchTradeOutcomeV16> {
         if decode_market_mode(self.header.mode)? != MarketModeV16::Live {
             return Err(V16Error::LockActive);
@@ -19237,6 +19299,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                 i + 1 == requests.len(),
                 long_attributable_asset_before_refresh,
                 short_attributable_asset_before_refresh,
+                cohort_tolerant,
             )?;
             long_requires_initial_margin |= applied.long_requires_initial_margin;
             short_requires_initial_margin |= applied.short_requires_initial_margin;
