@@ -20650,6 +20650,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         long_attributable_asset_before_refresh: Option<usize>,
         short_attributable_asset_before_refresh: Option<usize>,
         cohort_tolerant: bool,
+        pay_price: Option<u64>,
     ) -> V16Result<TradeApplyOutcomeV16> {
         let (abs_size_q, _, _) = Self::trade_signed_size_deltas(request.size_q)?;
         let trade_preflight = self.validate_trade_position_preflight(
@@ -20667,6 +20668,9 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         let fee = checked_fee_bps(fee_notional, request.fee_bps)?;
         let fee_a = self.charge_account_fee_current_not_atomic(long_account, fee)?;
         let fee_b = self.charge_account_fee_current_not_atomic(short_account, fee)?;
+        if let Some(pay_price) = pay_price {
+            self.settle_trade_price_difference_not_atomic(long_account, short_account, request.asset_index, abs_size_q, pay_price)?;
+        }
         // Pre-fill side OI for the grow-only side-OI cap gate below.
         let pre_fill_asset = self.asset_state(request.asset_index)?;
         self.begin_terminal_trade_residual_if_needed(
@@ -20937,6 +20941,53 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         })
     }
 
+    /// Fork (Turbopump maker quotes): the cohort-tolerant trade, economically at `pay_price` (the
+    /// difference from the effective price is settled in principal between the two accounts, see
+    /// `settle_trade_price_difference_not_atomic`).
+    pub fn execute_trade_with_fee_cohort_tolerant_at_price_not_atomic(
+        &mut self,
+        long_account: &mut PortfolioV16ViewMut<'_>,
+        short_account: &mut PortfolioV16ViewMut<'_>,
+        request: TradeRequestV16,
+        pay_price: u64,
+    ) -> V16Result<TradeOutcomeV16> {
+        let outcome = self.execute_batch_with_fee_scoped_inner_with_price_not_atomic(
+            long_account,
+            short_account,
+            core::slice::from_ref(&request),
+            true,
+            Some(pay_price),
+        )?;
+        Ok(TradeOutcomeV16 {
+            fee_a: outcome.fee_a,
+            fee_b: outcome.fee_b,
+            notional: outcome.notional,
+        })
+    }
+
+    /// Fork (Turbopump maker quotes): the ordinary (loss-stale scoped) trade, economically at
+    /// `pay_price` (see `settle_trade_price_difference_not_atomic`).
+    pub fn execute_trade_with_fee_loss_stale_scoped_at_price_not_atomic(
+        &mut self,
+        long_account: &mut PortfolioV16ViewMut<'_>,
+        short_account: &mut PortfolioV16ViewMut<'_>,
+        request: TradeRequestV16,
+        pay_price: u64,
+    ) -> V16Result<TradeOutcomeV16> {
+        let outcome = self.execute_batch_with_fee_scoped_inner_with_price_not_atomic(
+            long_account,
+            short_account,
+            core::slice::from_ref(&request),
+            false,
+            Some(pay_price),
+        )?;
+        Ok(TradeOutcomeV16 {
+            fee_a: outcome.fee_a,
+            fee_b: outcome.fee_b,
+            notional: outcome.notional,
+        })
+    }
+
     fn execute_batch_with_fee_scoped_inner_not_atomic(
         &mut self,
         long_account: &mut PortfolioV16ViewMut<'_>,
@@ -20944,6 +20995,20 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         requests: &[TradeRequestV16],
         cohort_tolerant: bool,
     ) -> V16Result<BatchTradeOutcomeV16> {
+        self.execute_batch_with_fee_scoped_inner_with_price_not_atomic(long_account, short_account, requests, cohort_tolerant, None)
+    }
+
+    fn execute_batch_with_fee_scoped_inner_with_price_not_atomic(
+        &mut self,
+        long_account: &mut PortfolioV16ViewMut<'_>,
+        short_account: &mut PortfolioV16ViewMut<'_>,
+        requests: &[TradeRequestV16],
+        cohort_tolerant: bool,
+        pay_price: Option<u64>,
+    ) -> V16Result<BatchTradeOutcomeV16> {
+        if pay_price.is_some() && requests.len() != 1 {
+            return Err(V16Error::InvalidConfig);
+        }
         self.validate_unconfigured_market_tail()?;
         let mut ignore_unrelated_loss_stale =
             decode_bool(self.header.loss_stale_active)? && !requests.is_empty();
@@ -20970,6 +21035,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             short_account,
             requests,
             cohort_tolerant,
+            pay_price,
         );
         if ignore_unrelated_loss_stale {
             self.header.loss_stale_active = restore_loss_stale_active;
@@ -20987,6 +21053,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         short_account: &mut PortfolioV16ViewMut<'_>,
         requests: &[TradeRequestV16],
         cohort_tolerant: bool,
+        pay_price: Option<u64>,
     ) -> V16Result<BatchTradeOutcomeV16> {
         if decode_market_mode(self.header.mode)? != MarketModeV16::Live {
             return Err(V16Error::LockActive);
@@ -21058,6 +21125,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                 long_attributable_asset_before_refresh,
                 short_attributable_asset_before_refresh,
                 cohort_tolerant,
+                pay_price,
             )?;
             long_requires_initial_margin |= applied.long_requires_initial_margin;
             short_requires_initial_margin |= applied.short_requires_initial_margin;
@@ -21311,6 +21379,52 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         .validate()?;
         account.header.health_cert.valid = 0;
         Ok(paid)
+    }
+
+    /// Fork (Turbopump maker quotes, 2026-11-06): a trade the LP's matcher priced at `pay_price`
+    /// rather than at the asset's effective price settles the difference in principal, so the
+    /// trade is economically at `pay_price`: the long pays `size x (pay_price - effective)` to the
+    /// short when it is positive, and receives it when negative. Capital moves from one account to
+    /// the other, so `c_tot`, the vault and insurance are unchanged. The payer must hold the amount
+    /// in capital with no unsettled loss (the trade refuses otherwise); both certificates go stale,
+    /// as for a fee, and are recomputed by the trade's own recertification and margin checks.
+    fn settle_trade_price_difference_not_atomic(
+        &mut self,
+        long_account: &mut PortfolioV16ViewMut<'_>,
+        short_account: &mut PortfolioV16ViewMut<'_>,
+        asset_index: usize,
+        abs_size_q: u128,
+        pay_price: u64,
+    ) -> V16Result<()> {
+        if pay_price == 0 || pay_price > MAX_ORACLE_PRICE {
+            return Err(V16Error::InvalidConfig);
+        }
+        let effective = self.asset_state(asset_index)?.effective_price;
+        if pay_price == effective || abs_size_q == 0 {
+            return Ok(());
+        }
+        let amount = trade_notional_floor(abs_size_q, pay_price.abs_diff(effective))?;
+        if amount == 0 {
+            return Ok(());
+        }
+        if pay_price > effective {
+            Self::move_trade_principal(long_account, short_account, amount)
+        } else {
+            Self::move_trade_principal(short_account, long_account, amount)
+        }
+    }
+
+    fn move_trade_principal(payer: &mut PortfolioV16ViewMut<'_>, payee: &mut PortfolioV16ViewMut<'_>, amount: u128) -> V16Result<()> {
+        if payer.header.pnl.get() < 0 || payer.header.capital.get() < amount {
+            return Err(V16Error::NonProgress);
+        }
+        let paid = payer.header.capital.get().checked_sub(amount).ok_or(V16Error::CounterUnderflow)?;
+        let got = payee.header.capital.get().checked_add(amount).ok_or(V16Error::ArithmeticOverflow)?;
+        payer.header.capital = V16PodU128::new(paid);
+        payee.header.capital = V16PodU128::new(got);
+        payer.header.health_cert.valid = 0;
+        payee.header.health_cert.valid = 0;
+        Ok(())
     }
 
     fn charge_account_fee_current_not_atomic(
