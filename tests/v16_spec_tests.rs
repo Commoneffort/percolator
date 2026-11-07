@@ -14881,20 +14881,20 @@ fn fork_trade_at_price_settles_the_difference_in_principal_and_conserves_money()
     let vault = market.header.vault.get();
     let insurance = market.header.insurance.get();
     let request = TradeRequestV16 { asset_index: 0, size_q: signed_q(10 * POS_SCALE), exec_price: 100, fee_bps: 0 };
-    // The long buys 10 at 103 while the effective price is 100: it pays 10 x 3 = 30 to the short.
-    market.execute_trade_with_fee_cohort_tolerant_at_price_not_atomic(&mut long, &mut short, request, 103).expect("trade at 103");
-    assert_eq!(long.header.capital.get(), 10_000 - 30);
-    assert_eq!(short.header.capital.get(), 10_000 + 30);
+    // The long buys 10 at 101 while the effective price is 100: it pays 10 x 1 = 10 to the short.
+    market.execute_trade_with_fee_cohort_tolerant_at_price_not_atomic(&mut long, &mut short, request, 101).expect("trade at 101");
+    assert_eq!(long.header.capital.get(), 10_000 - 10);
+    assert_eq!(short.header.capital.get(), 10_000 + 10);
     assert_eq!((market.header.c_tot.get(), market.header.vault.get(), market.header.insurance.get()), (c_tot, vault, insurance), "money only moved between the two");
-    // Closing at 98 while the price is still 100: the long sells 10 below it and pays another 20.
+    // Closing at 99 while the price is still 100: the long sells 10 below it and pays another 10.
     let close = TradeRequestV16 { asset_index: 0, size_q: signed_q(10 * POS_SCALE), exec_price: 100, fee_bps: 0 };
-    market.execute_trade_with_fee_cohort_tolerant_at_price_not_atomic(&mut short, &mut long, close, 98).expect("close at 98");
-    assert_eq!(long.header.capital.get(), 10_000 - 50, "bought at 103, sold at 98: lost 5 x 10");
-    assert_eq!(short.header.capital.get(), 10_000 + 50);
+    market.execute_trade_with_fee_cohort_tolerant_at_price_not_atomic(&mut short, &mut long, close, 99).expect("close at 99");
+    assert_eq!(long.header.capital.get(), 10_000 - 20, "bought at 101, sold at 99: lost 2 x 10");
+    assert_eq!(short.header.capital.get(), 10_000 + 20);
     assert_eq!(market.header.c_tot.get(), c_tot);
     // At the effective price nothing moves (the ordinary cohort-tolerant trade).
     market.execute_trade_with_fee_cohort_tolerant_at_price_not_atomic(&mut long, &mut short, request, 100).expect("trade at 100");
-    assert_eq!(long.header.capital.get(), 10_000 - 50);
+    assert_eq!(long.header.capital.get(), 10_000 - 20);
     market.validate_shape().unwrap();
     long.validate_with_market(&market.as_view()).unwrap();
     short.validate_with_market(&market.as_view()).unwrap();
@@ -14908,12 +14908,12 @@ fn fork_trade_at_price_refuses_a_payer_without_the_principal() {
     let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
     let mut long = PortfolioV16ViewMut::new(&mut long_header);
     let mut short = PortfolioV16ViewMut::new(&mut short_header);
-    market.deposit_not_atomic(&mut long, 20).unwrap();
+    market.deposit_not_atomic(&mut long, 5).unwrap();
     market.deposit_not_atomic(&mut short, 10_000).unwrap();
-    let request = TradeRequestV16 { asset_index: 0, size_q: signed_q(POS_SCALE / 100), exec_price: 100, fee_bps: 0 };
-    // 0.01 at 100 + 3000: the long would owe 30 and holds 20.
-    assert_eq!(market.execute_trade_with_fee_cohort_tolerant_at_price_not_atomic(&mut long, &mut short, request, 3_100), Err(V16Error::NonProgress));
-    assert_eq!(long.header.capital.get(), 20);
+    let request = TradeRequestV16 { asset_index: 0, size_q: signed_q(10 * POS_SCALE), exec_price: 100, fee_bps: 0 };
+    // 10 at 101: the long would owe 10 and holds 5.
+    assert_eq!(market.execute_trade_with_fee_cohort_tolerant_at_price_not_atomic(&mut long, &mut short, request, 101), Err(V16Error::NonProgress));
+    assert_eq!(long.header.capital.get(), 5);
 }
 
 #[test]
@@ -14928,8 +14928,27 @@ fn fork_ordinary_trade_at_price_settles_the_difference_too() {
         market.deposit_not_atomic(account, 10_000).unwrap();
     }
     let request = TradeRequestV16 { asset_index: 0, size_q: signed_q(10 * POS_SCALE), exec_price: 100, fee_bps: 0 };
-    // Bought below the price: the long receives 10 x 2 from the short.
-    market.execute_trade_with_fee_loss_stale_scoped_at_price_not_atomic(&mut long, &mut short, request, 98).expect("trade at 98");
-    assert_eq!((long.header.capital.get(), short.header.capital.get()), (10_020, 9_980));
+    // Bought below the price: the long receives 10 x 1 from the short.
+    market.execute_trade_with_fee_loss_stale_scoped_at_price_not_atomic(&mut long, &mut short, request, 99).expect("trade at 99");
+    assert_eq!((long.header.capital.get(), short.header.capital.get()), (10_010, 9_990));
     market.validate_shape().unwrap();
+}
+
+#[test]
+fn fork_trade_at_price_is_bounded_to_one_percent_of_the_effective_price() {
+    let (mut header, mut markets) = market_fixture(1, 100);
+    let mut long_header = account_fixture(1, 237);
+    let mut short_header = account_fixture(1, 238);
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut long = PortfolioV16ViewMut::new(&mut long_header);
+    let mut short = PortfolioV16ViewMut::new(&mut short_header);
+    for account in [&mut long, &mut short] {
+        market.deposit_not_atomic(account, 10_000).unwrap();
+    }
+    let request = TradeRequestV16 { asset_index: 0, size_q: signed_q(POS_SCALE), exec_price: 100, fee_bps: 0 };
+    // 2% away: refused, nothing moved.
+    assert_eq!(market.execute_trade_with_fee_cohort_tolerant_at_price_not_atomic(&mut long, &mut short, request, 102), Err(V16Error::InvalidConfig));
+    assert_eq!(long.header.capital.get(), 10_000);
+    // 1% away: allowed.
+    market.execute_trade_with_fee_cohort_tolerant_at_price_not_atomic(&mut long, &mut short, request, 101).expect("within 1%");
 }
