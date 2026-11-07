@@ -21381,6 +21381,10 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         Ok(paid)
     }
 
+    /// Fork: the most a trade's price paid (`settle_trade_price_difference_not_atomic`) may be from
+    /// the effective price, in bps (Turbopump's router quotes within the same 1%).
+    pub const AT_PRICE_BAND_BPS: u64 = 100;
+
     /// Fork (Turbopump maker quotes, 2026-11-06): a trade the LP's matcher priced at `pay_price`
     /// rather than at the asset's effective price settles the difference in principal, so the
     /// trade is economically at `pay_price`: the long pays `size x (pay_price - effective)` to the
@@ -21402,6 +21406,12 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         let effective = self.asset_state(asset_index)?.effective_price;
         if pay_price == effective || abs_size_q == 0 {
             return Ok(());
+        }
+        // Any LP's matcher can ask for this, not only a router's: the engine itself bounds how far
+        // the price paid may be from its own, so a taker calling Percolator directly against an
+        // unknown LP can lose at most this much to its price.
+        if (pay_price.abs_diff(effective) as u128).saturating_mul(10_000) > (effective as u128).saturating_mul(Self::AT_PRICE_BAND_BPS as u128) {
+            return Err(V16Error::InvalidConfig);
         }
         let amount = trade_notional_floor(abs_size_q, pay_price.abs_diff(effective))?;
         if amount == 0 {
