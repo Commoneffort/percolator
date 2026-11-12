@@ -9692,6 +9692,13 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         {
             return Err(V16Error::Stale);
         }
+        // Upstream #249: in Resolved mode a withdrawal must fit within the resolved surplus,
+        // preserving the backing junior payouts and source claims still need.
+        if decode_market_mode(self.header.mode)? == MarketModeV16::Resolved
+            && amount > self.resolved_counterparty_backing_surplus(domain)?
+        {
+            return Err(V16Error::LockActive);
+        }
         let (bucket, source) = V16Core::prepare_counterparty_backing_withdraw_delta(
             bucket,
             self.source_credit_for_domain(domain)?,
